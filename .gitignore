@@ -1,0 +1,12 @@
+# Meson / Ninja
+/build/
+
+# Local overrides (keep stackcomp.conf.example in git)
+/stackcomp.conf
+
+# Editor / tooling (optional local symlinks)
+/compile_commands.json
+
+# Debug / cores
+core
+vgcore.*

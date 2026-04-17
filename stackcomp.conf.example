@@ -1,0 +1,100 @@
+# Copy to ~/.config/stackcomp/config or set STACKCOMP_CONFIG / stackcomp -c PATH
+# Full option list: CONFIG.md in this repository.
+# IPC (layout control from another terminal): on by default under $XDG_RUNTIME_DIR;
+# use stackcomp --no-ipc to disable. stackcomp --layout tile talks to a running instance when the socket exists.
+# stackcomp --reload-config sends "reload config" over IPC (re-read this file, run reload= hook).
+#
+# Optional lifecycle hooks (single [hooks] block; each value is sh -c):
+# [hooks]
+# startup = waybar &
+# shutdown = pkill -x waybar 2>/dev/null || true
+# reload = pkill -USR1 waybar 2>/dev/null || true
+# Each [bind] block is one shortcut. Modifier set uses mods= (Super, Shift, Ctrl, Alt).
+# Optional when= runs /bin/sh -c '...' on each key press; exit 0 means the bind is active.
+# Runtime env for when=: STACKCOMP_LAYOUT is stack, tile, or scroll.
+
+[bind]
+mods = Super
+key = Return
+action = exec
+command = alacritty
+
+[bind]
+mods = Super+Shift
+key = Q
+action = close
+
+[bind]
+mods = Super
+key = Escape
+action = quit
+
+# Layout: stack (floating) vs tile (equal columns across outputs)
+# [bind]
+# mods = Super
+# key = T
+# action = layout_toggle
+#
+# actions: layout_toggle, layout_tile, layout_stack, layout_scroll (aliases: tile, stack, scroll)
+# Tiling/scroll sort order: tile_left / tile_right (or tile_prev / tile_next, scroll_left / scroll_right),
+# tile_first / tile_last, tile_move with optional command= signed steps (default 1), e.g. command = -3
+#
+# [bind]
+# mods = Super+Shift
+# key = bracketleft
+# action = tile_left
+#
+# [bind]
+# mods = Super+Shift
+# key = bracketright
+# action = tile_right
+#
+# [bind]
+# mods = Super+Shift
+# key = Home
+# action = tile_first
+#
+# [bind]
+# mods = Super+Shift
+# key = End
+# action = tile_last
+#
+# Grid row (same column, one step up/down in the tile grid).
+# All tile_* / tile_grid_* actions only run on a focused XDG toplevel in tile layout
+# (not a tile float). They are no-ops if you only have layer-shell clients (e.g. swaybg)
+# focused or nothing focused—click a real window first. Running swaybg does not steal
+# these shortcuts from stackcomp.
+# [bind]
+# mods = Super+Shift
+# key = Up
+# action = tile_up
+#
+# [bind]
+# mods = Super+Shift
+# key = Down
+# action = tile_down
+#
+# Bubble to top / bottom of column: tile_col_top, tile_col_bottom
+# Grid steps by direction (same-row left/right, same-column up/down):
+#   action = tile_grid_move, command = left
+#   action = tile_grid_move, command = up 2
+# Legacy vertical-only: command = -2  (same as command = up 2)
+
+# Tiling rules (POSIX extended regex). First matching [tile_rule] wins.
+# Use app_id= and/or title= (both present → both must match). mode=float skips the grid.
+# order= integer: lower places earlier (left/top) among tiled windows.
+# [tile_rule]
+# app_id = ^org\\.wezfurlong\\.wezterm$
+# mode = float
+#
+# [tile_rule]
+# title = ^vim
+# order = -10
+
+# Example: launcher only if fuzzel exists
+# [bind]
+# mods = Super
+# key = D
+# action = exec
+# command = fuzzel
+# when = command -v fuzzel >/dev/null 2>&1
