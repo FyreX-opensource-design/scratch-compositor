@@ -27,6 +27,7 @@ struct wlr_layer_shell_v1;
 struct wlr_layer_surface_v1;
 struct wlr_scene_layer_surface_v1;
 struct wlr_xdg_output_manager_v1;
+struct wlr_screencopy_manager_v1;
 
 struct comp_config;
 
@@ -79,6 +80,10 @@ struct comp_toplevel {
 	uint32_t tile_user_key;
 	bool tile_float;
 	int tile_order;
+	/** Tile/scroll layout target position (scene node lerps here when layout_anim_tracked). */
+	int layout_tgt_x, layout_tgt_y;
+	double layout_anim_x, layout_anim_y;
+	bool layout_anim_tracked;
 	struct wl_listener map;
 	struct wl_listener unmap;
 	struct wl_listener commit;
@@ -108,6 +113,7 @@ struct comp_server {
 	struct wlr_data_device_manager *data_device_mgr;
 	struct wlr_output_layout *output_layout;
 	struct wlr_xdg_output_manager_v1 *xdg_output_manager;
+	struct wlr_screencopy_manager_v1 *screencopy_manager;
 	struct wlr_scene *scene;
 	/** Scene stacking (back to front): background, layout+outputs, bottom, windows, top, overlay. */
 	struct wlr_scene_tree *layer_trees[4];
@@ -147,6 +153,8 @@ struct comp_server {
 	struct wl_event_source *ipc_event_source;
 	int ipc_listen_fd;
 	char ipc_socket_path[108];
+	/** CLOCK_MONOTONIC ns; used for layout position easing in tile/scroll. */
+	uint64_t layout_anim_last_ns;
 };
 
 bool server_init(struct comp_server *server);

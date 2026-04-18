@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <linux/input-event-codes.h>
+#include <math.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -31,6 +32,7 @@
 #include <wlr/types/wlr_output_layout.h>
 #include <wlr/types/wlr_pointer.h>
 #include <wlr/types/wlr_scene.h>
+#include <wlr/types/wlr_screencopy_v1.h>
 #include <wlr/types/wlr_seat.h>
 #include <wlr/types/wlr_subcompositor.h>
 #include <wlr/types/wlr_xcursor_manager.h>
@@ -44,6 +46,7 @@
 #include "server.h"
 
 static void focus_toplevel(struct comp_server *server, struct comp_toplevel *toplevel);
+static struct wlr_output *primary_wlr_output(struct comp_server *server);
 static void process_cursor_motion(struct comp_server *server, uint32_t time_msec);
 static void begin_move(struct comp_server *server, struct comp_toplevel *view, bool swallow_left_release);
 static void ipc_fini(struct comp_server *server);
@@ -103,6 +106,104 @@ static void scroll_sync_to_focused(struct comp_server *server)
 	free(arr);
 }
 
+/** Seconds since CLOCK_MONOTONIC epoch (for layout animation delta time). */
+static uint64_t timespec_to_ns(const struct timespec *ts)
+{
+	return (uint64_t)ts->tv_sec * 1000000000ull + (uint64_t)ts->tv_nsec;
+}
+
+static bool layout_anim_effective(const struct comp_server *server)
+{
+	return server->config && server->config->layout_anim_enabled;
+}
+
+/** Returns true if any tiled view still needs another frame to reach its target. */
+static bool layout_anim_tick(struct comp_server *server, const struct timespec *now)
+{
+	if (server->layout != COMP_LAYOUT_TILE && server->layout != COMP_LAYOUT_SCROLL) {
+		return false;
+	}
+	if (!layout_anim_effective(server)) {
+		return false;
+	}
+	const double lambda = server->config->layout_anim_lambda;
+	const double eps = server->config->layout_anim_epsilon;
+	const uint64_t now_ns = timespec_to_ns(now);
+	if (server->layout_anim_last_ns == 0) {
+		server->layout_anim_last_ns = now_ns;
+		return false;
+	}
+	double dt = (double)(now_ns - server->layout_anim_last_ns) / 1e9;
+	server->layout_anim_last_ns = now_ns;
+	if (dt <= 0.0) {
+		return false;
+	}
+	if (dt > 0.1) {
+		dt = 0.1;
+	}
+	const double k = 1.0 - exp(-lambda * dt);
+	bool any = false;
+	struct comp_toplevel *v;
+	wl_list_for_each(v, &server->toplevels, link) {
+		if (!v->layout_anim_tracked) {
+			continue;
+		}
+		if (!v->xdg_toplevel->base->surface->mapped || v->tile_float) {
+			continue;
+		}
+		if (server->grab == COMP_GRAB_MOVE && v == server->grabbed_toplevel) {
+			continue;
+		}
+		const double dx = (double)v->layout_tgt_x - v->layout_anim_x;
+		const double dy = (double)v->layout_tgt_y - v->layout_anim_y;
+		if (fabs(dx) < eps && fabs(dy) < eps) {
+			if (v->scene_tree->node.x != v->layout_tgt_x || v->scene_tree->node.y != v->layout_tgt_y) {
+				wlr_scene_node_set_position(&v->scene_tree->node, v->layout_tgt_x, v->layout_tgt_y);
+				any = true;
+			}
+			v->layout_anim_x = (double)v->layout_tgt_x;
+			v->layout_anim_y = (double)v->layout_tgt_y;
+			continue;
+		}
+		v->layout_anim_x += dx * k;
+		v->layout_anim_y += dy * k;
+		const int ix = (int)lround(v->layout_anim_x);
+		const int iy = (int)lround(v->layout_anim_y);
+		wlr_scene_node_set_position(&v->scene_tree->node, ix, iy);
+		any = true;
+	}
+	return any;
+}
+
+/** After targets change, ensure outputs repaint even if no client buffer update occurs yet. */
+static void layout_anim_kick_outputs(struct comp_server *server)
+{
+	if (server->layout != COMP_LAYOUT_TILE && server->layout != COMP_LAYOUT_SCROLL) {
+		return;
+	}
+	if (!layout_anim_effective(server)) {
+		return;
+	}
+	const double eps = server->config->layout_anim_epsilon;
+	struct comp_toplevel *v;
+	wl_list_for_each(v, &server->toplevels, link) {
+		if (!v->layout_anim_tracked || !v->xdg_toplevel->base->surface->mapped || v->tile_float) {
+			continue;
+		}
+		if (server->grab == COMP_GRAB_MOVE && v == server->grabbed_toplevel) {
+			continue;
+		}
+		if (fabs((double)v->layout_tgt_x - v->layout_anim_x) > eps ||
+		    fabs((double)v->layout_tgt_y - v->layout_anim_y) > eps) {
+			struct comp_output *o;
+			wl_list_for_each(o, &server->outputs, link) {
+				wlr_output_schedule_frame(o->wlr_output);
+			}
+			return;
+		}
+	}
+}
+
 /* Hit surface under (lx, ly); sx/sy outputs are surface-local coords when non-NULL. */
 static struct wlr_surface *surface_at(struct comp_server *server, double lx, double ly,
 	double *sx, double *sy)
@@ -136,17 +237,35 @@ static void output_frame(struct wl_listener *listener, void *data)
 {
 	(void)data;
 	struct comp_output *output = wl_container_of(listener, output, frame);
+	struct comp_server *server = output->server;
 	struct timespec now;
 	clock_gettime(CLOCK_MONOTONIC, &now);
 
-	if (!wlr_scene_output_needs_frame(output->scene_output)) {
+	struct wlr_output *clock_out = primary_wlr_output(server);
+	const bool run_layout_anim = clock_out && output->wlr_output == clock_out;
+	const bool layout_anim = run_layout_anim && layout_anim_tick(server, &now);
+
+	if (!wlr_scene_output_needs_frame(output->scene_output) && !layout_anim) {
 		return;
 	}
 
 	if (!wlr_scene_output_commit(output->scene_output, NULL)) {
+		if (layout_anim) {
+			struct comp_output *o;
+			wl_list_for_each(o, &server->outputs, link) {
+				wlr_output_schedule_frame(o->wlr_output);
+			}
+		}
 		return;
 	}
 	wlr_scene_output_send_frame_done(output->scene_output, &now);
+
+	if (layout_anim) {
+		struct comp_output *o;
+		wl_list_for_each(o, &server->outputs, link) {
+			wlr_output_schedule_frame(o->wlr_output);
+		}
+	}
 }
 
 static struct wlr_output *primary_wlr_output(struct comp_server *server)
@@ -709,11 +828,27 @@ void server_arrange_toplevels(struct comp_server *server)
 	if (box.width <= 0 || box.height <= 0) {
 		return;
 	}
+	const bool anim_on = layout_anim_effective(server);
 	size_t n_tile = 0;
 	struct comp_toplevel **arr = tile_sorted_views(server, &n_tile);
 	if (!arr) {
+		struct comp_toplevel *u;
+		wl_list_for_each(u, &server->toplevels, link) {
+			u->layout_anim_tracked = false;
+		}
 		return;
 	}
+
+	struct comp_toplevel *t;
+	wl_list_for_each(t, &server->toplevels, link) {
+		if (!t->xdg_toplevel->base->surface->mapped) {
+			continue;
+		}
+		if (t->tile_float || !t->xdg_toplevel->base->initialized) {
+			t->layout_anim_tracked = false;
+		}
+	}
+
 	if (server->layout == COMP_LAYOUT_SCROLL) {
 		if (server->scroll_index < 0) {
 			server->scroll_index = 0;
@@ -729,10 +864,19 @@ void server_arrange_toplevels(struct comp_server *server)
 			}
 			const int rel = (int)j - server->scroll_index;
 			const int x = box.x + rel * box.width;
-			wlr_scene_node_set_position(&v->scene_tree->node, x, box.y);
+			const int y = box.y;
+			v->layout_tgt_x = x;
+			v->layout_tgt_y = y;
 			log_xdg_state("arrange-scroll:set_size", v);
 			wlr_xdg_toplevel_set_size(v->xdg_toplevel, box.width, box.height);
+			if (!anim_on || !v->layout_anim_tracked) {
+				v->layout_anim_x = (double)x;
+				v->layout_anim_y = (double)y;
+				wlr_scene_node_set_position(&v->scene_tree->node, x, y);
+				v->layout_anim_tracked = true;
+			}
 		}
+		layout_anim_kick_outputs(server);
 		free(arr);
 		return;
 	}
@@ -753,10 +897,18 @@ void server_arrange_toplevels(struct comp_server *server)
 		const int y = box.y + row * cell_h;
 		const int w = (col == cols - 1) ? (box.x + box.width - x) : cell_w;
 		const int h = (row == rows - 1) ? (box.y + box.height - y) : cell_h;
-		wlr_scene_node_set_position(&v->scene_tree->node, x, y);
+		v->layout_tgt_x = x;
+		v->layout_tgt_y = y;
 		log_xdg_state("arrange-tile:set_size", v);
 		wlr_xdg_toplevel_set_size(v->xdg_toplevel, w, h);
+		if (!anim_on || !v->layout_anim_tracked) {
+			v->layout_anim_x = (double)x;
+			v->layout_anim_y = (double)y;
+			wlr_scene_node_set_position(&v->scene_tree->node, x, y);
+			v->layout_anim_tracked = true;
+		}
 	}
+	layout_anim_kick_outputs(server);
 	free(arr);
 }
 
@@ -1061,8 +1213,15 @@ void server_set_layout(struct comp_server *server, enum comp_layout layout)
 			scroll_sync_to_focused(server);
 		}
 		server_arrange_toplevels(server);
-	} else if (server->focused_toplevel) {
-		wlr_scene_node_raise_to_top(&server->focused_toplevel->scene_tree->node);
+	} else {
+		struct comp_toplevel *v;
+		wl_list_for_each(v, &server->toplevels, link) {
+			v->layout_anim_tracked = false;
+		}
+		server->layout_anim_last_ns = 0;
+		if (server->focused_toplevel) {
+			wlr_scene_node_raise_to_top(&server->focused_toplevel->scene_tree->node);
+		}
 	}
 	comp_config_sync_layout_env(server->layout);
 }
@@ -1186,6 +1345,12 @@ static void ipc_process_line(struct comp_server *server, char *line)
 		const char *rest = line + 7;
 		while (*rest == ' ' || *rest == '\t') {
 			rest++;
+		}
+		if (!strncmp(rest, "move ", 5)) {
+			rest += 5;
+			while (*rest == ' ' || *rest == '\t') {
+				rest++;
+			}
 		}
 		if (!strcmp(rest, "prev") || !strcmp(rest, "left")) {
 			server_scroll_move(server, -1);
@@ -1529,6 +1694,10 @@ static void server_cursor_button(struct wl_listener *listener, void *data)
 			if (drop && drop != dragged && !dragged->tile_float && !drop->tile_float) {
 				tile_swap_sort_keys(dragged, drop);
 			}
+			if (dragged->layout_anim_tracked) {
+				dragged->layout_anim_x = (double)dragged->scene_tree->node.x;
+				dragged->layout_anim_y = (double)dragged->scene_tree->node.y;
+			}
 			server_arrange_toplevels(server);
 		}
 		if (ev->button == BTN_LEFT && server->swallow_left_release) {
@@ -1625,6 +1794,12 @@ bool server_init(struct comp_server *server)
 	server->output_layout = wlr_output_layout_create(dpy);
 	server->xdg_output_manager = wlr_xdg_output_manager_v1_create(dpy, server->output_layout);
 	if (!server->xdg_output_manager) {
+		return false;
+	}
+
+	server->screencopy_manager = wlr_screencopy_manager_v1_create(dpy);
+	if (!server->screencopy_manager) {
+		wlr_log(WLR_ERROR, "Failed to create wlr_screencopy_manager_v1");
 		return false;
 	}
 
@@ -1727,6 +1902,8 @@ int main(int argc, char **argv)
 	char tile_move_line[64];
 	bool tile_grid_from_argv = false;
 	char tile_grid_line[64];
+	bool scroll_move_from_argv = false;
+	char scroll_move_line[64];
 	bool no_ipc = false;
 	bool reload_config_from_argv = false;
 
@@ -1753,6 +1930,9 @@ int main(int argc, char **argv)
 				wlr_log(WLR_ERROR, "Unknown --layout %s (use stack, tile, or scroll)", v);
 				return 1;
 			}
+			layout_from_argv = true;
+		} else if (!strcmp(argv[i], "--scroll")) {
+			initial_layout = COMP_LAYOUT_SCROLL;
 			layout_from_argv = true;
 		} else if (!strcmp(argv[i], "--tile-move")) {
 			if (i + 1 >= argc) {
@@ -1814,6 +1994,28 @@ int main(int argc, char **argv)
 				snprintf(tile_grid_line, sizeof(tile_grid_line), "tile grid %s\n", v);
 			}
 			tile_grid_from_argv = true;
+		} else if (!strcmp(argv[i], "--scroll-move")) {
+			if (i + 1 >= argc) {
+				wlr_log(WLR_ERROR, "Missing value after --scroll-move");
+				return 1;
+			}
+			const char *v = argv[++i];
+			if (!strcasecmp(v, "prev") || !strcasecmp(v, "left")) {
+				snprintf(scroll_move_line, sizeof(scroll_move_line), "scroll prev\n");
+			} else if (!strcasecmp(v, "next") || !strcasecmp(v, "right")) {
+				snprintf(scroll_move_line, sizeof(scroll_move_line), "scroll next\n");
+			} else {
+				char *end = NULL;
+				(void)strtol(v, &end, 10);
+				if (!end || end == v || *end) {
+					wlr_log(WLR_ERROR,
+						"Unknown --scroll-move %s (use prev, next, left, right, or a signed integer)",
+						v);
+					return 1;
+				}
+				snprintf(scroll_move_line, sizeof(scroll_move_line), "scroll %s\n", v);
+			}
+			scroll_move_from_argv = true;
 		} else if (!strcmp(argv[i], "--ipc")) {
 			/* IPC is default-on when XDG_RUNTIME_DIR is set; flag kept for scripts. */
 		} else if (!strcmp(argv[i], "--no-ipc")) {
@@ -1847,6 +2049,13 @@ int main(int argc, char **argv)
 		}
 		wlr_log(WLR_INFO, "Sent tile grid to running stackcomp via IPC");
 	}
+	if (scroll_move_from_argv) {
+		if (ipc_client_send_line(scroll_move_line) != 0) {
+			wlr_log(WLR_ERROR, "No running stackcomp or IPC failed for --scroll-move");
+			return 1;
+		}
+		wlr_log(WLR_INFO, "Sent scroll move to running stackcomp via IPC");
+	}
 	if (layout_from_argv) {
 		char line[48];
 		const char *layout_word = initial_layout == COMP_LAYOUT_TILE ? "tile" :
@@ -1857,7 +2066,7 @@ int main(int argc, char **argv)
 			return 0;
 		}
 	}
-	if (tile_move_from_argv || tile_grid_from_argv) {
+	if (tile_move_from_argv || tile_grid_from_argv || scroll_move_from_argv) {
 		return 0;
 	}
 	if (!cfg_path && comp_config_default_path(cfg_buf, sizeof(cfg_buf))) {

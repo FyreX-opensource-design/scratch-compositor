@@ -1,7 +1,8 @@
 # Copy to ~/.config/stackcomp/config or set STACKCOMP_CONFIG / stackcomp -c PATH
 # Full option list: CONFIG.md in this repository.
 # IPC (layout control from another terminal): on by default under $XDG_RUNTIME_DIR;
-# use stackcomp --no-ipc to disable. stackcomp --layout tile talks to a running instance when the socket exists.
+# use stackcomp --no-ipc to disable. stackcomp --layout tile or --scroll talks to a running instance when the socket exists.
+# stackcomp --scroll-move prev|next|left|right|<N> sends scroll viewport steps over IPC (like --tile-move).
 # stackcomp --reload-config sends "reload config" over IPC (re-read this file, run reload= hook).
 #
 # Optional lifecycle hooks (single [hooks] block; each value is sh -c):
@@ -12,6 +13,12 @@
 # Each [bind] block is one shortcut. Modifier set uses mods= (Super, Shift, Ctrl, Alt).
 # Optional when= runs /bin/sh -c '...' on each key press; exit 0 means the bind is active.
 # Runtime env for when=: STACKCOMP_LAYOUT is stack, tile, or scroll.
+#
+# Optional easing when windows move in tile or scroll layout (see CONFIG.md → [layout_anim]):
+# [layout_anim]
+# enabled = yes
+# speed = 15
+# epsilon = 0.35
 
 [bind]
 mods = Super

@@ -223,6 +223,40 @@ void comp_config_sync_layout_env(enum comp_layout layout)
 	setenv("STACKCOMP_LAYOUT", layout_name(layout), 1);
 }
 
+static void apply_layout_anim_defaults(struct comp_config *cfg)
+{
+	cfg->layout_anim_enabled = true;
+	cfg->layout_anim_lambda = 15.0;
+	cfg->layout_anim_epsilon = 0.35;
+}
+
+static bool parse_bool_yes_no(const char *s, bool *out)
+{
+	if (!strcasecmp(s, "1") || !strcasecmp(s, "true") || !strcasecmp(s, "yes") || !strcasecmp(s, "on")) {
+		*out = true;
+		return true;
+	}
+	if (!strcasecmp(s, "0") || !strcasecmp(s, "false") || !strcasecmp(s, "no") || !strcasecmp(s, "off")) {
+		*out = false;
+		return true;
+	}
+	return false;
+}
+
+static bool parse_layout_anim_double(const char *path, size_t line_no, const char *key, const char *eq,
+	double min_v, double max_v, double *out)
+{
+	char *end = NULL;
+	errno = 0;
+	const double v = strtod(eq, &end);
+	if (!end || end == eq || *end || errno == ERANGE || v < min_v || v > max_v) {
+		wlr_log(WLR_ERROR, "%s:%zu: %s= expects a number in [%g, %g]", path, line_no, key, min_v, max_v);
+		return false;
+	}
+	*out = v;
+	return true;
+}
+
 static void load_defaults(struct comp_config *cfg)
 {
 	struct comp_keybind b;
@@ -713,6 +747,7 @@ bool comp_config_load(const char *path, struct comp_config **cfg_out)
 	if (!cfg) {
 		return false;
 	}
+	apply_layout_anim_defaults(cfg);
 
 	FILE *f = NULL;
 	if (path) {
@@ -733,6 +768,7 @@ bool comp_config_load(const char *path, struct comp_config **cfg_out)
 	bool in_bind = false;
 	bool in_tile = false;
 	bool in_hooks = false;
+	bool in_layout_anim = false;
 	char linebuf[4096];
 	size_t line_no = 0;
 	bool ok = true;
@@ -758,20 +794,25 @@ bool comp_config_load(const char *path, struct comp_config **cfg_out)
 			in_bind = false;
 			in_tile = false;
 			in_hooks = false;
+			in_layout_anim = false;
 			if (!strcasecmp(line, "[bind]")) {
 				in_bind = true;
 			} else if (!strcasecmp(line, "[tile_rule]") || !strcasecmp(line, "[tilerule]")) {
 				in_tile = true;
 			} else if (!strcasecmp(line, "[hooks]")) {
 				in_hooks = true;
+			} else if (!strcasecmp(line, "[layout_anim]") || !strcasecmp(line, "[layout_animation]")) {
+				in_layout_anim = true;
 			} else {
 				wlr_log(WLR_ERROR, "%s:%zu: unknown section %s", path, line_no, line);
 				ok = false;
 			}
 			continue;
 		}
-		if (!in_bind && !in_tile && !in_hooks) {
-			wlr_log(WLR_ERROR, "%s:%zu: key=value outside [bind], [tile_rule], or [hooks]", path, line_no);
+		if (!in_bind && !in_tile && !in_hooks && !in_layout_anim) {
+			wlr_log(WLR_ERROR,
+				"%s:%zu: key=value outside [bind], [tile_rule], [hooks], or [layout_anim]",
+				path, line_no);
 			ok = false;
 			break;
 		}
@@ -848,6 +889,28 @@ bool comp_config_load(const char *path, struct comp_config **cfg_out)
 				cfg->hook_reload = xstrdup(eq);
 			} else {
 				wlr_log(WLR_ERROR, "%s:%zu: unknown hooks key '%s'", path, line_no, line);
+				ok = false;
+			}
+		} else if (in_layout_anim) {
+			if (!strcasecmp(line, "enabled") || !strcasecmp(line, "enable")) {
+				bool b;
+				if (!parse_bool_yes_no(eq, &b)) {
+					wlr_log(WLR_ERROR, "%s:%zu: %s= expects yes/no, true/false, 1/0, or on/off", path,
+						line_no, line);
+					ok = false;
+				} else {
+					cfg->layout_anim_enabled = b;
+				}
+			} else if (!strcasecmp(line, "lambda") || !strcasecmp(line, "speed")) {
+				if (!parse_layout_anim_double(path, line_no, line, eq, 0.5, 120.0, &cfg->layout_anim_lambda)) {
+					ok = false;
+				}
+			} else if (!strcasecmp(line, "epsilon") || !strcasecmp(line, "snap")) {
+				if (!parse_layout_anim_double(path, line_no, line, eq, 0.05, 64.0, &cfg->layout_anim_epsilon)) {
+					ok = false;
+				}
+			} else {
+				wlr_log(WLR_ERROR, "%s:%zu: unknown layout_anim key '%s'", path, line_no, line);
 				ok = false;
 			}
 		}

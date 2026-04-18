@@ -66,6 +66,20 @@ If there is no config file path (defaults-only startup) and no default file on d
 
 ---
 
+## Section `[layout_anim]` (optional)
+
+A single block **`[layout_anim]`** (alias **`[layout_animation]`**) configures **scene-node** easing when tiled or scroll-layout windows **move** to new cells or scroll positions. Client **configure / resize** is unchanged; only translation is smoothed. If the section is omitted, easing is **on** with the defaults below.
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| **`enabled`** / **`enable`** | `yes` | `yes` / `true` / `1` / `on` or `no` / `false` / `0` / `off`. When off, positions snap immediately on every arrange. |
+| **`lambda`** / **`speed`** | `15` | Exponential approach rate per second (higher = snappier). Allowed range **0.5–120**. |
+| **`epsilon`** / **`snap`** | `0.35` | Pixel distance below which a window snaps to its target. Allowed range **0.05–64**. |
+
+Changes apply after **config reload** (or compositor restart).
+
+---
+
 ## Actions reference
 
 Unless noted, tiling-related actions are **no-ops** when not in **tile** layout, when there is **no focused** toplevel, when the focused surface is **unmapped**, or when the focused window is a **tile float** (floating within tile mode).
@@ -137,12 +151,13 @@ If both **`app_id`** and **`title`** are set on a rule, **both** must match. At 
 
 From another terminal you can send one-line commands to a running instance (Unix socket under **`$XDG_RUNTIME_DIR/stackcomp-ipc.sock`** when IPC is enabled), for example:
 
-- **`layout stack`**, **`layout tile`**, **`layout toggle`**
+- **`layout stack`**, **`layout tile`**, **`layout scroll`**, **`layout toggle`**
 - **`tile move …`** (same semantics as sort-order actions above)
+- **`scroll …`** or **`scroll move …`** — **`prev`** / **`left`**, **`next`** / **`right`**, or a **signed integer** (viewport steps in scroll layout; no-op if not in scroll layout)
 - **`tile grid …`** (same forms as **`tile_grid_move` `command=`**)
 - **`reload config`** or **`reload`** — re-read the config file (same path as at startup, or the default path), replace keybinds and tile rules, refresh tile layout if applicable, then run the new file’s **`reload`** hook from **`[hooks]`**.
 
-The **`stackcomp`** binary also accepts **`--layout`**, **`--tile-move`**, **`--tile-grid`**, and **`--reload-config`** for scripting; see **`COMPOSITOR.md`** for behavior when no compositor is listening.
+The **`stackcomp`** binary also accepts **`--layout`**, **`--scroll`** (same as **`--layout scroll`**), **`--tile-move`**, **`--scroll-move`**, **`--tile-grid`**, and **`--reload-config`** for scripting; see **`COMPOSITOR.md`** for behavior when no compositor is listening.
 
 ---
 

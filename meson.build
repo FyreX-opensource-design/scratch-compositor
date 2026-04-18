@@ -12,6 +12,9 @@ project(
 add_project_arguments('-D_GNU_SOURCE', language: 'c')
 add_project_arguments('-DWLR_USE_UNSTABLE', language: 'c')
 
+cc = meson.get_compiler('c')
+m_dep = cc.find_library('m', required: false)
+
 wlroots = dependency('wlroots-0.19')
 wayland_server = dependency('wayland-server')
 xkbcommon = dependency('xkbcommon')
@@ -40,6 +43,6 @@ executable(
   'src/config.c',
   xdg_shell_server_h,
   layer_shell_server_h,
-  dependencies: [wlroots, wayland_server, xkbcommon],
+  dependencies: [wlroots, wayland_server, xkbcommon, m_dep],
   install: true,
 )
