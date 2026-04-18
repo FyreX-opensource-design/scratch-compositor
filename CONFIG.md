@@ -80,6 +80,32 @@ Changes apply after **config reload** (or compositor restart).
 
 ---
 
+## Section `[decoration]` (optional)
+
+Optional defaults for **xdg-decoration** (see **`[decoration_rule]`** below). If omitted, the compositor defaults to **stripping** client-side title bars in **tile** and **scroll** layouts, for clients that support the protocol.
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| **`strip_in_tile_scroll`** / **`default_strip`** / **`strip`** | `yes` | If **yes**, windows that do **not** match a `[decoration_rule]` use **server-side** decoration mode in tile/scroll (clients hide their own title bar; stackcomp does not draw SSD, so the window appears frameless). If **no**, those windows keep **client-side** decorations in tile/scroll. |
+
+**Stack** layout and **tile-float** windows always use **client-side** decorations (normal title bars), regardless of this section.
+
+---
+
+## Section `[decoration_rule]` (optional)
+
+POSIX **extended** regex rules, same style as **`[tile_rule]`**: optional **`app_id`** and/or **`title`** (both must match when both are present). **First matching rule wins** in file order.
+
+| Key | Meaning |
+|-----|---------|
+| **`app_id`** / **`app-id`** | Regex matched against the XDG `app_id`. |
+| **`title`** | Regex matched against the window title. |
+| **`strip`** | `yes` or `no` — same as “strip client title bar in tile/scroll” for this match. If omitted in a rule block, it defaults to **yes**. |
+
+Use **`strip = no`** on specific apps (e.g. video players) to keep their client decorations while tiled.
+
+---
+
 ## Actions reference
 
 Unless noted, tiling-related actions are **no-ops** when not in **tile** layout, when there is **no focused** toplevel, when the focused surface is **unmapped**, or when the focused window is a **tile float** (floating within tile mode).

@@ -38,6 +38,7 @@
 #include <wlr/types/wlr_xcursor_manager.h>
 #include <wlr/types/wlr_layer_shell_v1.h>
 #include <wlr/types/wlr_xdg_output_v1.h>
+#include <wlr/types/wlr_xdg_decoration_v1.h>
 #include <wlr/types/wlr_xdg_shell.h>
 #include <wlr/util/log.h>
 #include <xkbcommon/xkbcommon.h>
@@ -54,6 +55,7 @@ static bool ipc_init(struct comp_server *server);
 static bool server_reload_config(struct comp_server *server);
 static struct comp_toplevel **tile_sorted_views(struct comp_server *server, size_t *n_out);
 static int tile_sorted_index(struct comp_toplevel **arr, size_t n, struct comp_toplevel *v);
+static void toplevel_apply_decoration_mode(struct comp_toplevel *view);
 
 /** True after `wlr_backend_start` so shutdown hook runs only for a real session. */
 static bool compositor_session_active;
@@ -515,6 +517,82 @@ static void server_refresh_all_tile_props(struct comp_server *server)
 	}
 }
 
+static void xdg_decoration_handle_destroy(struct wl_listener *listener, void *data)
+{
+	(void)data;
+	struct comp_toplevel *view = wl_container_of(listener, view, xdg_decoration_destroy);
+	wl_list_remove(&view->xdg_decoration_request_mode.link);
+	wl_list_remove(&view->xdg_decoration_destroy.link);
+	view->xdg_decoration = NULL;
+}
+
+static void xdg_decoration_handle_request_mode(struct wl_listener *listener, void *data)
+{
+	(void)data;
+	struct comp_toplevel *view = wl_container_of(listener, view, xdg_decoration_request_mode);
+	toplevel_apply_decoration_mode(view);
+}
+
+static void toplevel_apply_decoration_mode(struct comp_toplevel *view)
+{
+	if (!view->xdg_decoration) {
+		return;
+	}
+	/* wlr_xdg_toplevel_decoration_v1_set_mode schedules configure; wlroots asserts if !initialized. */
+	if (!view->xdg_toplevel->base->initialized) {
+		return;
+	}
+	struct comp_server *server = view->server;
+	enum wlr_xdg_toplevel_decoration_v1_mode mode = WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE;
+	if (server->layout == COMP_LAYOUT_STACK) {
+		mode = WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE;
+	} else if (view->tile_float) {
+		mode = WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE;
+	} else if (comp_config_decoration_prefer_server_side_tile_scroll(server->config, view->xdg_toplevel->app_id,
+			 view->xdg_toplevel->title)) {
+		mode = WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE;
+	} else {
+		mode = WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE;
+	}
+	wlr_xdg_toplevel_decoration_v1_set_mode(view->xdg_decoration, mode);
+}
+
+void server_sync_xdg_decorations(struct comp_server *server)
+{
+	struct comp_toplevel *t;
+	wl_list_for_each(t, &server->toplevels, link) {
+		toplevel_apply_decoration_mode(t);
+	}
+}
+
+static void xdg_new_toplevel_decoration(struct wl_listener *listener, void *data)
+{
+	struct comp_server *server = wl_container_of(listener, server, new_xdg_decoration);
+	struct wlr_xdg_toplevel_decoration_v1 *deco = data;
+	struct comp_toplevel *view = NULL;
+	struct comp_toplevel *t;
+	wl_list_for_each(t, &server->toplevels, link) {
+		if (t->xdg_toplevel == deco->toplevel) {
+			view = t;
+			break;
+		}
+	}
+	if (!view) {
+		return;
+	}
+	if (view->xdg_decoration) {
+		wl_list_remove(&view->xdg_decoration_destroy.link);
+		wl_list_remove(&view->xdg_decoration_request_mode.link);
+		view->xdg_decoration = NULL;
+	}
+	view->xdg_decoration = deco;
+	view->xdg_decoration_destroy.notify = xdg_decoration_handle_destroy;
+	wl_signal_add(&deco->events.destroy, &view->xdg_decoration_destroy);
+	view->xdg_decoration_request_mode.notify = xdg_decoration_handle_request_mode;
+	wl_signal_add(&deco->events.request_mode, &view->xdg_decoration_request_mode);
+	toplevel_apply_decoration_mode(view);
+}
+
 static void toplevel_handle_set_title(struct wl_listener *listener, void *data)
 {
 	(void)data;
@@ -524,6 +602,7 @@ static void toplevel_handle_set_title(struct wl_listener *listener, void *data)
 	    view->xdg_toplevel->base->surface->mapped) {
 		server_arrange_toplevels(view->server);
 	}
+	server_sync_xdg_decorations(view->server);
 }
 
 static void toplevel_handle_set_app_id(struct wl_listener *listener, void *data)
@@ -535,6 +614,7 @@ static void toplevel_handle_set_app_id(struct wl_listener *listener, void *data)
 	    view->xdg_toplevel->base->surface->mapped) {
 		server_arrange_toplevels(view->server);
 	}
+	server_sync_xdg_decorations(view->server);
 }
 
 static int cmp_toplevel_tile_order(const void *va, const void *vb)
@@ -630,6 +710,11 @@ static void toplevel_destroy(struct wl_listener *listener, void *data)
 {
 	(void)data;
 	struct comp_toplevel *view = wl_container_of(listener, view, destroy);
+	if (view->xdg_decoration) {
+		wl_list_remove(&view->xdg_decoration_destroy.link);
+		wl_list_remove(&view->xdg_decoration_request_mode.link);
+		view->xdg_decoration = NULL;
+	}
 	wl_list_remove(&view->map.link);
 	wl_list_remove(&view->unmap.link);
 	wl_list_remove(&view->commit.link);
@@ -666,6 +751,7 @@ static void toplevel_commit(struct wl_listener *listener, void *data)
 		log_xdg_state("commit:set_size0x0", view);
 		wlr_xdg_toplevel_set_size(view->xdg_toplevel, 0, 0);
 	}
+	toplevel_apply_decoration_mode(view);
 }
 
 static void toplevel_map(struct wl_listener *listener, void *data)
@@ -693,10 +779,12 @@ static void toplevel_map(struct wl_listener *listener, void *data)
 			wlr_scene_node_raise_to_top(&view->scene_tree->node);
 			focus_toplevel(view->server, view);
 			server_arrange_toplevels(view->server);
+			server_sync_xdg_decorations(view->server);
 			return;
 		}
 		focus_toplevel(view->server, view);
 		server_arrange_toplevels(view->server);
+		server_sync_xdg_decorations(view->server);
 		return;
 	}
 	int x = obox.x + (obox.width - geo->width) / 2;
@@ -704,6 +792,7 @@ static void toplevel_map(struct wl_listener *listener, void *data)
 	wlr_scene_node_set_position(&view->scene_tree->node, x, y);
 	wlr_scene_node_raise_to_top(&view->scene_tree->node);
 	focus_toplevel(view->server, view);
+	server_sync_xdg_decorations(view->server);
 }
 
 static void toplevel_request_move(struct wl_listener *listener, void *data)
@@ -1223,6 +1312,7 @@ void server_set_layout(struct comp_server *server, enum comp_layout layout)
 			wlr_scene_node_raise_to_top(&server->focused_toplevel->scene_tree->node);
 		}
 	}
+	server_sync_xdg_decorations(server);
 	comp_config_sync_layout_env(server->layout);
 }
 
@@ -1398,6 +1488,7 @@ static bool server_reload_config(struct comp_server *server)
 		server_refresh_all_tile_props(server);
 		server_arrange_toplevels(server);
 	}
+	server_sync_xdg_decorations(server);
 	comp_config_run_reload(server->config);
 	wlr_log(WLR_INFO, "reload: loaded config from %s", path);
 	return true;
@@ -1821,6 +1912,14 @@ bool server_init(struct comp_server *server)
 	wl_signal_add(&server->backend->events.new_input, &server->new_input);
 	server->xdg_shell_new_toplevel.notify = xdg_shell_new_toplevel;
 	wl_signal_add(&server->xdg_shell->events.new_toplevel, &server->xdg_shell_new_toplevel);
+
+	server->xdg_decoration_manager = wlr_xdg_decoration_manager_v1_create(dpy);
+	if (!server->xdg_decoration_manager) {
+		wlr_log(WLR_ERROR, "Failed to create wlr_xdg_decoration_manager_v1");
+		return false;
+	}
+	server->new_xdg_decoration.notify = xdg_new_toplevel_decoration;
+	wl_signal_add(&server->xdg_decoration_manager->events.new_toplevel_decoration, &server->new_xdg_decoration);
 
 	server->cursor = wlr_cursor_create();
 	wlr_cursor_attach_output_layout(server->cursor, server->output_layout);

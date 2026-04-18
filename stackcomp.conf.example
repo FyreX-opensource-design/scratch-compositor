@@ -19,6 +19,13 @@
 # enabled = yes
 # speed = 15
 # epsilon = 0.35
+#
+# xdg-decoration: hide client title bars (min/max/close) in tile & scroll by default (GTK/Qt/etc. that support it).
+# [decoration]
+# strip_in_tile_scroll = yes
+# [decoration_rule]
+# app_id = ^mpv$
+# strip = no
 
 [bind]
 mods = Super

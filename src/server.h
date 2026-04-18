@@ -28,6 +28,8 @@ struct wlr_layer_surface_v1;
 struct wlr_scene_layer_surface_v1;
 struct wlr_xdg_output_manager_v1;
 struct wlr_screencopy_manager_v1;
+struct wlr_xdg_decoration_manager_v1;
+struct wlr_xdg_toplevel_decoration_v1;
 
 struct comp_config;
 
@@ -92,6 +94,9 @@ struct comp_toplevel {
 	struct wl_listener request_resize;
 	struct wl_listener set_title;
 	struct wl_listener set_app_id;
+	struct wlr_xdg_toplevel_decoration_v1 *xdg_decoration;
+	struct wl_listener xdg_decoration_destroy;
+	struct wl_listener xdg_decoration_request_mode;
 };
 
 struct comp_keyboard {
@@ -129,6 +134,8 @@ struct comp_server {
 	struct wl_listener new_output;
 	struct wl_listener new_input;
 	struct wl_listener xdg_shell_new_toplevel;
+	struct wlr_xdg_decoration_manager_v1 *xdg_decoration_manager;
+	struct wl_listener new_xdg_decoration;
 	struct wl_listener cursor_motion;
 	struct wl_listener cursor_motion_absolute;
 	struct wl_listener cursor_button;
@@ -162,6 +169,8 @@ bool server_init(struct comp_server *server);
 void server_set_layout(struct comp_server *server, enum comp_layout layout);
 void server_toggle_layout(struct comp_server *server);
 void server_arrange_toplevels(struct comp_server *server);
+/** Re-apply xdg-decoration mode for every toplevel (layout / tile-float / config rules). */
+void server_sync_xdg_decorations(struct comp_server *server);
 
 /** Move focused tiled window by `steps` in sort order (+ toward end, − toward start). No-op if not tiled/focused. */
 void server_tile_move_focused_n(struct comp_server *server, int steps);

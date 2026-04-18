@@ -66,6 +66,17 @@ static void tile_rule_destroy(struct comp_tile_rule *r)
 	memset(r, 0, sizeof(*r));
 }
 
+static void decoration_rule_destroy(struct comp_decoration_rule *r)
+{
+	if (r->have_app_id) {
+		regfree(&r->app_id_re);
+	}
+	if (r->have_title) {
+		regfree(&r->title_re);
+	}
+	memset(r, 0, sizeof(*r));
+}
+
 void comp_config_free(struct comp_config *cfg)
 {
 	if (!cfg) {
@@ -79,6 +90,10 @@ void comp_config_free(struct comp_config *cfg)
 		tile_rule_destroy(&cfg->tile_rules[i]);
 	}
 	free(cfg->tile_rules);
+	for (size_t i = 0; i < cfg->n_decoration_rules; i++) {
+		decoration_rule_destroy(&cfg->decoration_rules[i]);
+	}
+	free(cfg->decoration_rules);
 	free(cfg->hook_startup);
 	free(cfg->hook_shutdown);
 	free(cfg->hook_reload);
@@ -228,6 +243,11 @@ static void apply_layout_anim_defaults(struct comp_config *cfg)
 	cfg->layout_anim_enabled = true;
 	cfg->layout_anim_lambda = 15.0;
 	cfg->layout_anim_epsilon = 0.35;
+}
+
+static void apply_decoration_defaults(struct comp_config *cfg)
+{
+	cfg->decoration_strip_default = true;
 }
 
 static bool parse_bool_yes_no(const char *s, bool *out)
@@ -704,6 +724,72 @@ static bool flush_tile_rule(struct comp_config *cfg, struct tile_rule_parse *p, 
 	return true;
 }
 
+struct decoration_rule_parse {
+	char *app_id_pat;
+	char *title_pat;
+	bool strip;
+	bool strip_set;
+};
+
+static void decoration_rule_parse_reset(struct decoration_rule_parse *p)
+{
+	free(p->app_id_pat);
+	free(p->title_pat);
+	memset(p, 0, sizeof(*p));
+}
+
+static bool flush_decoration_rule(struct comp_config *cfg, struct decoration_rule_parse *p, size_t line_no)
+{
+	const bool have_app = p->app_id_pat && p->app_id_pat[0];
+	const bool have_tit = p->title_pat && p->title_pat[0];
+	if (!have_app && !have_tit) {
+		decoration_rule_parse_reset(p);
+		(void)line_no;
+		return true;
+	}
+	if (!p->strip_set) {
+		p->strip = true;
+	}
+	struct comp_decoration_rule rule;
+	memset(&rule, 0, sizeof(rule));
+	rule.prefer_server_side = p->strip;
+	if (have_app) {
+		int err = regcomp(&rule.app_id_re, p->app_id_pat, REG_EXTENDED | REG_NOSUB);
+		if (err != 0) {
+			char errbuf[128];
+			regerror(err, NULL, errbuf, sizeof(errbuf));
+			wlr_log(WLR_ERROR, "Config line ~%zu: bad decoration_rule app_id regex: %s", line_no, errbuf);
+			decoration_rule_parse_reset(p);
+			return false;
+		}
+		rule.have_app_id = true;
+	}
+	if (have_tit) {
+		int err = regcomp(&rule.title_re, p->title_pat, REG_EXTENDED | REG_NOSUB);
+		if (err != 0) {
+			char errbuf[128];
+			regerror(err, NULL, errbuf, sizeof(errbuf));
+			wlr_log(WLR_ERROR, "Config line ~%zu: bad decoration_rule title regex: %s", line_no, errbuf);
+			if (rule.have_app_id) {
+				regfree(&rule.app_id_re);
+			}
+			decoration_rule_parse_reset(p);
+			return false;
+		}
+		rule.have_title = true;
+	}
+	decoration_rule_parse_reset(p);
+
+	struct comp_decoration_rule *nr = realloc(cfg->decoration_rules, (cfg->n_decoration_rules + 1) * sizeof(*nr));
+	if (!nr) {
+		decoration_rule_destroy(&rule);
+		return false;
+	}
+	cfg->decoration_rules = nr;
+	cfg->decoration_rules[cfg->n_decoration_rules++] = rule;
+	return true;
+}
+
 static bool parse_tile_mode(const char *v, bool *float_out)
 {
 	if (!strcasecmp(v, "float") || !strcasecmp(v, "floating")) {
@@ -715,6 +801,27 @@ static bool parse_tile_mode(const char *v, bool *float_out)
 		return true;
 	}
 	return false;
+}
+
+bool comp_config_decoration_prefer_server_side_tile_scroll(const struct comp_config *cfg, const char *app_id,
+	const char *title)
+{
+	if (!cfg) {
+		return true;
+	}
+	const char *a = (app_id && app_id[0]) ? app_id : "";
+	const char *t = (title && title[0]) ? title : "";
+	for (size_t i = 0; i < cfg->n_decoration_rules; i++) {
+		const struct comp_decoration_rule *r = &cfg->decoration_rules[i];
+		if (r->have_app_id && regexec(&r->app_id_re, a, 0, NULL, 0) != 0) {
+			continue;
+		}
+		if (r->have_title && regexec(&r->title_re, t, 0, NULL, 0) != 0) {
+			continue;
+		}
+		return r->prefer_server_side;
+	}
+	return cfg->decoration_strip_default;
 }
 
 void comp_config_tile_props_for_toplevel(const struct comp_config *cfg, const char *app_id,
@@ -748,6 +855,7 @@ bool comp_config_load(const char *path, struct comp_config **cfg_out)
 		return false;
 	}
 	apply_layout_anim_defaults(cfg);
+	apply_decoration_defaults(cfg);
 
 	FILE *f = NULL;
 	if (path) {
@@ -765,10 +873,13 @@ bool comp_config_load(const char *path, struct comp_config **cfg_out)
 
 	struct comp_keybind cur = {0};
 	struct tile_rule_parse cur_tile = {0};
+	struct decoration_rule_parse cur_dec = {0};
 	bool in_bind = false;
 	bool in_tile = false;
 	bool in_hooks = false;
 	bool in_layout_anim = false;
+	bool in_decoration = false;
+	bool in_decoration_rule = false;
 	char linebuf[4096];
 	size_t line_no = 0;
 	bool ok = true;
@@ -789,12 +900,19 @@ bool comp_config_load(const char *path, struct comp_config **cfg_out)
 				ok = false;
 				break;
 			}
+			if (in_decoration_rule && !flush_decoration_rule(cfg, &cur_dec, line_no)) {
+				ok = false;
+				break;
+			}
 			keybind_clear(&cur);
 			tile_rule_parse_reset(&cur_tile);
+			decoration_rule_parse_reset(&cur_dec);
 			in_bind = false;
 			in_tile = false;
 			in_hooks = false;
 			in_layout_anim = false;
+			in_decoration = false;
+			in_decoration_rule = false;
 			if (!strcasecmp(line, "[bind]")) {
 				in_bind = true;
 			} else if (!strcasecmp(line, "[tile_rule]") || !strcasecmp(line, "[tilerule]")) {
@@ -803,15 +921,19 @@ bool comp_config_load(const char *path, struct comp_config **cfg_out)
 				in_hooks = true;
 			} else if (!strcasecmp(line, "[layout_anim]") || !strcasecmp(line, "[layout_animation]")) {
 				in_layout_anim = true;
+			} else if (!strcasecmp(line, "[decoration]")) {
+				in_decoration = true;
+			} else if (!strcasecmp(line, "[decoration_rule]")) {
+				in_decoration_rule = true;
 			} else {
 				wlr_log(WLR_ERROR, "%s:%zu: unknown section %s", path, line_no, line);
 				ok = false;
 			}
 			continue;
 		}
-		if (!in_bind && !in_tile && !in_hooks && !in_layout_anim) {
+		if (!in_bind && !in_tile && !in_hooks && !in_layout_anim && !in_decoration && !in_decoration_rule) {
 			wlr_log(WLR_ERROR,
-				"%s:%zu: key=value outside [bind], [tile_rule], [hooks], or [layout_anim]",
+				"%s:%zu: key=value outside a recognized [section]",
 				path, line_no);
 			ok = false;
 			break;
@@ -913,6 +1035,42 @@ bool comp_config_load(const char *path, struct comp_config **cfg_out)
 				wlr_log(WLR_ERROR, "%s:%zu: unknown layout_anim key '%s'", path, line_no, line);
 				ok = false;
 			}
+		} else if (in_decoration) {
+			if (!strcasecmp(line, "strip_in_tile_scroll") || !strcasecmp(line, "default_strip") ||
+			    !strcasecmp(line, "strip")) {
+				bool b;
+				if (!parse_bool_yes_no(eq, &b)) {
+					wlr_log(WLR_ERROR, "%s:%zu: %s= expects yes/no, true/false, 1/0, or on/off", path,
+						line_no, line);
+					ok = false;
+				} else {
+					cfg->decoration_strip_default = b;
+				}
+			} else {
+				wlr_log(WLR_ERROR, "%s:%zu: unknown decoration key '%s'", path, line_no, line);
+				ok = false;
+			}
+		} else if (in_decoration_rule) {
+			if (!strcasecmp(line, "app_id") || !strcasecmp(line, "app-id")) {
+				free(cur_dec.app_id_pat);
+				cur_dec.app_id_pat = xstrdup(eq);
+			} else if (!strcasecmp(line, "title")) {
+				free(cur_dec.title_pat);
+				cur_dec.title_pat = xstrdup(eq);
+			} else if (!strcasecmp(line, "strip")) {
+				bool b;
+				if (!parse_bool_yes_no(eq, &b)) {
+					wlr_log(WLR_ERROR, "%s:%zu: strip= expects yes/no, true/false, 1/0, or on/off", path,
+						line_no);
+					ok = false;
+				} else {
+					cur_dec.strip = b;
+					cur_dec.strip_set = true;
+				}
+			} else {
+				wlr_log(WLR_ERROR, "%s:%zu: unknown decoration_rule key '%s'", path, line_no, line);
+				ok = false;
+			}
 		}
 		if (!ok) {
 			break;
@@ -926,8 +1084,12 @@ bool comp_config_load(const char *path, struct comp_config **cfg_out)
 	if (ok && in_tile) {
 		ok = flush_tile_rule(cfg, &cur_tile, line_no);
 	}
+	if (ok && in_decoration_rule) {
+		ok = flush_decoration_rule(cfg, &cur_dec, line_no);
+	}
 	keybind_clear(&cur);
 	tile_rule_parse_reset(&cur_tile);
+	decoration_rule_parse_reset(&cur_dec);
 
 	if (!ok) {
 		wlr_log(WLR_ERROR, "Failed to parse config %s", path);
