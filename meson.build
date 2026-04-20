@@ -37,12 +37,29 @@ layer_shell_server_h = custom_target(
   command: [wayland_scanner, 'server-header', '@INPUT@', '@OUTPUT@'],
 )
 
+ext_workspace_xml = wayland_protocols.get_variable('pkgdatadir') / 'staging/ext-workspace/ext-workspace-v1.xml'
+ext_workspace_server_h = custom_target(
+  'ext-workspace-v1-protocol-h',
+  output: 'ext-workspace-v1-protocol.h',
+  input: ext_workspace_xml,
+  command: [wayland_scanner, 'server-header', '@INPUT@', '@OUTPUT@'],
+)
+ext_workspace_private_c = custom_target(
+  'ext-workspace-v1-protocol-c',
+  output: 'ext-workspace-v1-protocol.c',
+  input: ext_workspace_xml,
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
+)
+
 executable(
   'stackcomp',
   'src/main.c',
   'src/config.c',
+  'src/ext_workspace.c',
   xdg_shell_server_h,
   layer_shell_server_h,
+  ext_workspace_server_h,
+  ext_workspace_private_c,
   dependencies: [wlroots, wayland_server, xkbcommon, m_dep],
   install: true,
 )

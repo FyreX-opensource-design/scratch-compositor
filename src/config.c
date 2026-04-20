@@ -217,6 +217,22 @@ static bool parse_action(const char *v, enum comp_keybind_action *a)
 		*a = COMP_KEYBIND_TILE_GRID_MOVE;
 		return true;
 	}
+	if (!strcasecmp(v, "workspace") || !strcasecmp(v, "workspace_goto")) {
+		*a = COMP_KEYBIND_WORKSPACE_GOTO;
+		return true;
+	}
+	if (!strcasecmp(v, "workspace_next") || !strcasecmp(v, "ws_next")) {
+		*a = COMP_KEYBIND_WORKSPACE_NEXT;
+		return true;
+	}
+	if (!strcasecmp(v, "workspace_prev") || !strcasecmp(v, "ws_prev")) {
+		*a = COMP_KEYBIND_WORKSPACE_PREV;
+		return true;
+	}
+	if (!strcasecmp(v, "workspace_move") || !strcasecmp(v, "ws_move")) {
+		*a = COMP_KEYBIND_WORKSPACE_MOVE;
+		return true;
+	}
 	return false;
 }
 
@@ -236,6 +252,14 @@ static const char *layout_name(enum comp_layout layout)
 void comp_config_sync_layout_env(enum comp_layout layout)
 {
 	setenv("STACKCOMP_LAYOUT", layout_name(layout), 1);
+}
+
+void comp_config_sync_shell_env(struct comp_server *server)
+{
+	setenv("STACKCOMP_LAYOUT", layout_name(server->layout), 1);
+	char wbuf[16];
+	snprintf(wbuf, sizeof(wbuf), "%d", server->current_workspace + 1);
+	setenv("STACKCOMP_WORKSPACE", wbuf, 1);
 }
 
 static void apply_layout_anim_defaults(struct comp_config *cfg)
@@ -470,7 +494,7 @@ bool comp_config_try_bindings(struct comp_config *cfg, struct comp_server *serve
 	}
 
 	uint32_t mods = mods_filtered & COMP_BIND_MOD_FILTER;
-	comp_config_sync_layout_env(server->layout);
+	comp_config_sync_shell_env(server);
 
 	for (size_t i = 0; i < cfg->n_binds; i++) {
 		struct comp_keybind *b = &cfg->binds[i];
@@ -548,6 +572,32 @@ bool comp_config_try_bindings(struct comp_config *cfg, struct comp_server *serve
 		case COMP_KEYBIND_TILE_GRID_MOVE:
 			server_tile_grid_run_command(server, b->command);
 			return true;
+		case COMP_KEYBIND_WORKSPACE_GOTO: {
+			if (!b->command || !b->command[0]) {
+				return true;
+			}
+			const long w = strtol(b->command, NULL, 10);
+			if (w >= 1 && w <= COMP_WORKSPACE_COUNT) {
+				server_workspace_go(server, (int)w - 1);
+			}
+			return true;
+		}
+		case COMP_KEYBIND_WORKSPACE_NEXT:
+			server_workspace_relative(server, 1);
+			return true;
+		case COMP_KEYBIND_WORKSPACE_PREV:
+			server_workspace_relative(server, -1);
+			return true;
+		case COMP_KEYBIND_WORKSPACE_MOVE: {
+			if (!b->command || !b->command[0]) {
+				return true;
+			}
+			const long w = strtol(b->command, NULL, 10);
+			if (w >= 1 && w <= COMP_WORKSPACE_COUNT) {
+				server_workspace_move_focused(server, (int)w - 1);
+			}
+			return true;
+		}
 		}
 	}
 	return false;
@@ -653,6 +703,20 @@ static bool flush_bind(struct comp_config *cfg, struct comp_keybind *cur, size_t
 	if (cur->action == COMP_KEYBIND_TILE_GRID_MOVE &&
 	    !tile_grid_move_command_ok(cur->command ? cur->command : "", line_no)) {
 		return false;
+	}
+	if (cur->action == COMP_KEYBIND_WORKSPACE_GOTO || cur->action == COMP_KEYBIND_WORKSPACE_MOVE) {
+		if (!cur->command || !cur->command[0]) {
+			wlr_log(WLR_ERROR, "Config line ~%zu: workspace / workspace_move needs command= 1..%d", line_no,
+				COMP_WORKSPACE_COUNT);
+			return false;
+		}
+		char *end = NULL;
+		const long w = strtol(cur->command, &end, 10);
+		if (!end || end == cur->command || *end || w < 1 || w > COMP_WORKSPACE_COUNT) {
+			wlr_log(WLR_ERROR, "Config line ~%zu: workspace command must be an integer 1..%d", line_no,
+				COMP_WORKSPACE_COUNT);
+			return false;
+		}
 	}
 	if (!append_bind(cfg, cur)) {
 		return false;

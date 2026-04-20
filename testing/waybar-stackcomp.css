@@ -1,0 +1,41 @@
+/* Styles for config/waybar-stackcomp.jsonc (ext/workspaces). */
+
+* {
+  border: none;
+  font-family: sans-serif;
+  font-size: 13px;
+  min-height: 0;
+}
+
+window#waybar {
+  background-color: rgba(20, 20, 24, 0.92);
+  color: #e4e4e7;
+}
+
+#workspaces {
+  padding: 0 4px;
+}
+
+#workspaces button {
+  padding: 0 8px;
+  color: #71717a;
+  background: transparent;
+}
+
+#workspaces button:hover {
+  color: #a1a1aa;
+}
+
+#workspaces button.active {
+  color: #fafafa;
+  font-weight: 600;
+}
+
+#workspaces button.urgent {
+  color: #f87171;
+}
+
+#clock {
+  padding: 0 10px;
+  color: #a1a1aa;
+}

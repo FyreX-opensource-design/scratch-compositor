@@ -9,6 +9,8 @@
 
 struct comp_server;
 
+void comp_config_sync_shell_env(struct comp_server *server);
+
 enum comp_keybind_action {
 	COMP_KEYBIND_NONE = 0,
 	COMP_KEYBIND_QUIT,
@@ -35,6 +37,12 @@ enum comp_keybind_action {
 	 * or legacy bare signed integer (vertical only, + down / − up).
 	 */
 	COMP_KEYBIND_TILE_GRID_MOVE,
+	/** command= workspace number 1..COMP_WORKSPACE_COUNT (see server.h). */
+	COMP_KEYBIND_WORKSPACE_GOTO,
+	COMP_KEYBIND_WORKSPACE_NEXT,
+	COMP_KEYBIND_WORKSPACE_PREV,
+	/** command= target workspace 1..COMP_WORKSPACE_COUNT. */
+	COMP_KEYBIND_WORKSPACE_MOVE,
 };
 
 struct comp_keybind {

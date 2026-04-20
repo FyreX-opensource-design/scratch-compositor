@@ -50,6 +50,18 @@ action = quit
 # action = layout_toggle
 #
 # actions: layout_toggle, layout_tile, layout_stack, layout_scroll (aliases: tile, stack, scroll)
+# Workspaces 1..9: workspace / workspace_goto (command=), workspace_next / ws_next, workspace_prev / ws_prev,
+# workspace_move / ws_move (command=). when= sees STACKCOMP_WORKSPACE.
+# [bind]
+# mods = Super
+# key = 1
+# action = workspace
+# command = 1
+# [bind]
+# mods = Super
+# key = 2
+# action = workspace_move
+# command = 2
 # Tiling/scroll sort order: tile_left / tile_right (or tile_prev / tile_next, scroll_left / scroll_right),
 # tile_first / tile_last, tile_move with optional command= signed steps (default 1), e.g. command = -3
 #

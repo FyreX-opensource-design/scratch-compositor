@@ -26,7 +26,7 @@ Each `[bind]` block describes **one** shortcut. Start a new `[bind]` section for
 | **`key`** | Yes | Keysym name passed to **xkb_keysym_from_name** (case-insensitive), for example `Return`, `Escape`, `Q`, `Left`, `F1`. |
 | **`action`** | Yes | What to do when the chord matches (see **Actions** below). |
 | **`command`** | For some actions | Shell command line for **`exec`**, or parameter for **`tile_move`** / **`tile_grid_move`** as documented below. |
-| **`when`** | No | If set, **`/bin/sh -c '…'`** is run **on every key press** before the bind is considered; **exit status 0** means the bind is active. Non-zero skips the bind. The shell sees `STACKCOMP_LAYOUT` as `stack`, `tile`, or `scroll`. |
+| **`when`** | No | If set, **`/bin/sh -c '…'`** is run **on every key press** before the bind is considered; **exit status 0** means the bind is active. Non-zero skips the bind. The shell sees **`STACKCOMP_LAYOUT`** as `stack`, `tile`, or `scroll`, and **`STACKCOMP_WORKSPACE`** as the current workspace number **`1`**..**`9`** (decimal string). |
 
 Bindings are matched using modifier and keysym sampled **before** the compositor updates XKB state from the key event, so the chord matches what the user pressed.
 
@@ -122,6 +122,17 @@ Unless noted, tiling-related actions are **no-ops** when not in **tile** layout,
 | **`layout_stack`** | `stack` | — | Force **stack** layout. |
 | **`layout_scroll`** | `scroll` | — | Force **scroll** layout (niri-like horizontal strip). |
 
+### Workspaces (9 virtual desktops)
+
+There are **nine** workspaces (**`1`**..**`9`** in config and IPC; internally zero-based). New windows open on the **current** workspace. Only windows on the **active** workspace are **visible** and receive pointer hits; tiling and scroll logic apply **per workspace** (each workspace has its own **scroll** slot index). **`when=`** predicates can use **`STACKCOMP_WORKSPACE`**.
+
+| `action` | Aliases | `command` | Effect |
+|----------|---------|-----------|--------|
+| **`workspace`** | `workspace_goto` | **Required** `1`..`9` | Switch to that workspace (focus first mapped XDG window there, or clear keyboard focus). |
+| **`workspace_next`** | `ws_next` | — | Next workspace (wraps **9** → **1**). |
+| **`workspace_prev`** | `ws_prev` | — | Previous workspace (wraps **1** → **9**). |
+| **`workspace_move`** | `ws_move` | **Required** `1`..`9` | Move the **focused** toplevel to that workspace (refocus on the current workspace if it left). |
+
 ### Sort order (linear index along the tiled list)
 
 These move the **focused tiled** window along the internal sort order (row-major grid order, not “same row only”).
@@ -182,8 +193,11 @@ From another terminal you can send one-line commands to a running instance (Unix
 - **`scroll …`** or **`scroll move …`** — **`prev`** / **`left`**, **`next`** / **`right`**, or a **signed integer** (viewport steps in scroll layout; no-op if not in scroll layout)
 - **`tile grid …`** (same forms as **`tile_grid_move` `command=`**)
 - **`reload config`** or **`reload`** — re-read the config file (same path as at startup, or the default path), replace keybinds and tile rules, refresh tile layout if applicable, then run the new file’s **`reload`** hook from **`[hooks]`**.
+- **`workspace N`** — switch to workspace **`1`**..**`9`**
+- **`workspace next`** / **`workspace prev`** — cycle workspaces (wraps)
+- **`workspace move N`** — move the focused toplevel to workspace **`N`**
 
-The **`stackcomp`** binary also accepts **`--layout`**, **`--scroll`** (same as **`--layout scroll`**), **`--tile-move`**, **`--scroll-move`**, **`--tile-grid`**, and **`--reload-config`** for scripting; see **`COMPOSITOR.md`** for behavior when no compositor is listening.
+The **`stackcomp`** binary also accepts **`--layout`**, **`--scroll`** (same as **`--layout scroll`**), **`--tile-move`**, **`--scroll-move`**, **`--tile-grid`**, **`--workspace`** **`1`**..**`9`** or **`next`** / **`prev`**, **`--workspace-move`** **`N`** (move focused window to workspace **`N`**), and **`--reload-config`** for scripting; see **`COMPOSITOR.md`** for behavior when no compositor is listening.
 
 ---
 

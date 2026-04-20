@@ -1,0 +1,39 @@
+// Minimal Waybar config for stackcomp (ext-workspace-v1).
+// Requires a Waybar build with the ext/workspaces module (not the default wlr/workspaces).
+//
+// Run from another VT or nested session, after stackcomp sets WAYLAND_DISPLAY:
+//   waybar -c "$(pwd)/config/waybar-stackcomp.jsonc" -s "$(pwd)/config/waybar-stackcomp.css"
+//
+// Workspace names from stackcomp are "1".."9"; stable ids are stackcomp-ws-0 .. stackcomp-ws-8.
+
+{
+  "layer": "top",
+  "position": "top",
+  "height": 28,
+  "spacing": 6,
+  "margin-top": 0,
+  "margin-left": 8,
+  "margin-right": 8,
+
+  "modules-left": ["ext/workspaces"],
+  "modules-center": [],
+  "modules-right": ["clock"],
+
+  "ext/workspaces": {
+    "format": "{name}",
+    "tooltip-format": "{name} — id {id}",
+    "on-click": "activate",
+    "sort-by-coordinates": true,
+    "all-outputs": true,
+    "format-icons": {
+      "active": "●",
+      "default": "○"
+    }
+  },
+
+  "clock": {
+    "interval": 1,
+    "format": "{:%H:%M:%S}",
+    "tooltip-format": "<big>{:%Y-%m-%d}</big>\n<tt>{calendar}</tt>"
+  }
+}

@@ -33,6 +33,9 @@ struct wlr_xdg_toplevel_decoration_v1;
 
 struct comp_config;
 
+/** Number of virtual workspaces (indices 0 .. COUNT-1; keybinds/IPC use 1..COUNT). */
+#define COMP_WORKSPACE_COUNT 9
+
 enum comp_layout {
 	COMP_LAYOUT_STACK = 0,
 	COMP_LAYOUT_TILE,
@@ -86,6 +89,8 @@ struct comp_toplevel {
 	int layout_tgt_x, layout_tgt_y;
 	double layout_anim_x, layout_anim_y;
 	bool layout_anim_tracked;
+	/** Virtual workspace index 0 .. COMP_WORKSPACE_COUNT-1. */
+	int workspace;
 	struct wl_listener map;
 	struct wl_listener unmap;
 	struct wl_listener commit;
@@ -147,7 +152,9 @@ struct comp_server {
 	struct wl_list toplevels;
 	enum comp_layout layout;
 	struct comp_toplevel *focused_toplevel;
-	int scroll_index;
+	int current_workspace;
+	/** Scroll slot index per workspace (scroll layout only). */
+	int workspace_scroll_index[COMP_WORKSPACE_COUNT];
 	enum comp_grab grab;
 	struct comp_toplevel *grabbed_toplevel;
 	double grab_cursor_x, grab_cursor_y;
@@ -171,6 +178,15 @@ void server_toggle_layout(struct comp_server *server);
 void server_arrange_toplevels(struct comp_server *server);
 /** Re-apply xdg-decoration mode for every toplevel (layout / tile-float / config rules). */
 void server_sync_xdg_decorations(struct comp_server *server);
+
+/** Show only toplevels on current_workspace; layer-shell unchanged. */
+void server_workspace_apply_visibility(struct comp_server *server);
+/** Switch to workspace index `idx` (0 .. COMP_WORKSPACE_COUNT-1). */
+void server_workspace_go(struct comp_server *server, int idx);
+/** Rotate current workspace by `delta` (e.g. +1 / -1), wrapping. */
+void server_workspace_relative(struct comp_server *server, int delta);
+/** Move focused toplevel to workspace `target` (0-based). */
+void server_workspace_move_focused(struct comp_server *server, int target);
 
 /** Move focused tiled window by `steps` in sort order (+ toward end, − toward start). No-op if not tiled/focused. */
 void server_tile_move_focused_n(struct comp_server *server, int steps);

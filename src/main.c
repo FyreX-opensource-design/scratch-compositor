@@ -44,6 +44,7 @@
 #include <xkbcommon/xkbcommon.h>
 
 #include "config.h"
+#include "ext_workspace.h"
 #include "server.h"
 
 static void focus_toplevel(struct comp_server *server, struct comp_toplevel *toplevel);
@@ -103,7 +104,7 @@ static void scroll_sync_to_focused(struct comp_server *server)
 	}
 	const int idx = tile_sorted_index(arr, n, server->focused_toplevel);
 	if (idx >= 0) {
-		server->scroll_index = idx;
+		server->workspace_scroll_index[server->current_workspace] = idx;
 	}
 	free(arr);
 }
@@ -150,6 +151,9 @@ static bool layout_anim_tick(struct comp_server *server, const struct timespec *
 		if (!v->layout_anim_tracked) {
 			continue;
 		}
+		if (v->workspace != server->current_workspace) {
+			continue;
+		}
 		if (!v->xdg_toplevel->base->surface->mapped || v->tile_float) {
 			continue;
 		}
@@ -190,6 +194,9 @@ static void layout_anim_kick_outputs(struct comp_server *server)
 	struct comp_toplevel *v;
 	wl_list_for_each(v, &server->toplevels, link) {
 		if (!v->layout_anim_tracked || !v->xdg_toplevel->base->surface->mapped || v->tile_float) {
+			continue;
+		}
+		if (v->workspace != server->current_workspace) {
 			continue;
 		}
 		if (server->grab == COMP_GRAB_MOVE && v == server->grabbed_toplevel) {
@@ -322,6 +329,7 @@ static void layer_shell_arrange(struct comp_server *server)
 		}
 		out->layer_workarea = usable;
 	}
+	server_workspace_apply_visibility(server);
 	if ((server->layout == COMP_LAYOUT_TILE || server->layout == COMP_LAYOUT_SCROLL) &&
 	    server->grab != COMP_GRAB_MOVE) {
 		server_arrange_toplevels(server);
@@ -447,6 +455,7 @@ static void output_destroy(struct wl_listener *listener, void *data)
 {
 	(void)data;
 	struct comp_output *output = wl_container_of(listener, output, destroy);
+	ext_workspace_on_output_remove(output->server, output->wlr_output);
 	wl_list_remove(&output->frame.link);
 	wl_list_remove(&output->commit.link);
 	wl_list_remove(&output->destroy.link);
@@ -493,6 +502,7 @@ static void server_new_output(struct wl_listener *listener, void *data)
 	output->destroy.notify = output_destroy;
 	wl_signal_add(&wlr_output->events.destroy, &output->destroy);
 	wl_list_insert(&server->outputs, &output->link);
+	ext_workspace_on_output_new(server, wlr_output);
 	layer_shell_arrange(server);
 }
 
@@ -656,6 +666,9 @@ static struct comp_toplevel **tile_sorted_views(struct comp_server *server, size
 		if (!t->xdg_toplevel->base->surface->mapped || t->tile_float) {
 			continue;
 		}
+		if (t->workspace != server->current_workspace) {
+			continue;
+		}
 		n_tile++;
 	}
 	if (n_tile == 0) {
@@ -668,6 +681,9 @@ static struct comp_toplevel **tile_sorted_views(struct comp_server *server, size
 	size_t i = 0;
 	wl_list_for_each(t, &server->toplevels, link) {
 		if (!t->xdg_toplevel->base->surface->mapped || t->tile_float) {
+			continue;
+		}
+		if (t->workspace != server->current_workspace) {
 			continue;
 		}
 		arr[i++] = t;
@@ -779,11 +795,13 @@ static void toplevel_map(struct wl_listener *listener, void *data)
 			wlr_scene_node_raise_to_top(&view->scene_tree->node);
 			focus_toplevel(view->server, view);
 			server_arrange_toplevels(view->server);
+			server_workspace_apply_visibility(view->server);
 			server_sync_xdg_decorations(view->server);
 			return;
 		}
 		focus_toplevel(view->server, view);
 		server_arrange_toplevels(view->server);
+		server_workspace_apply_visibility(view->server);
 		server_sync_xdg_decorations(view->server);
 		return;
 	}
@@ -792,6 +810,7 @@ static void toplevel_map(struct wl_listener *listener, void *data)
 	wlr_scene_node_set_position(&view->scene_tree->node, x, y);
 	wlr_scene_node_raise_to_top(&view->scene_tree->node);
 	focus_toplevel(view->server, view);
+	server_workspace_apply_visibility(view->server);
 	server_sync_xdg_decorations(view->server);
 }
 
@@ -822,6 +841,7 @@ static void xdg_shell_new_toplevel(struct wl_listener *listener, void *data)
 	view->tile_user_key = ++tile_user_key_gen;
 	view->tile_float = false;
 	view->tile_order = 0;
+	view->workspace = server->current_workspace;
 
 	view->set_title.notify = toplevel_handle_set_title;
 	wl_signal_add(&xdg_toplevel->events.set_title, &view->set_title);
@@ -850,6 +870,9 @@ static void focus_toplevel(struct comp_server *server, struct comp_toplevel *top
 	}
 	if (!toplevel->xdg_toplevel->base->initialized) {
 		log_xdg_state("focus:skip-not-initialized", toplevel);
+		return;
+	}
+	if (toplevel->workspace != server->current_workspace) {
 		return;
 	}
 	struct comp_toplevel *prev = server->focused_toplevel;
@@ -939,11 +962,12 @@ void server_arrange_toplevels(struct comp_server *server)
 	}
 
 	if (server->layout == COMP_LAYOUT_SCROLL) {
-		if (server->scroll_index < 0) {
-			server->scroll_index = 0;
+		int *const scr = &server->workspace_scroll_index[server->current_workspace];
+		if (*scr < 0) {
+			*scr = 0;
 		}
-		if (server->scroll_index >= (int)n_tile) {
-			server->scroll_index = (int)n_tile - 1;
+		if (*scr >= (int)n_tile) {
+			*scr = (int)n_tile - 1;
 		}
 		for (size_t j = 0; j < n_tile; j++) {
 			struct comp_toplevel *v = arr[j];
@@ -951,7 +975,7 @@ void server_arrange_toplevels(struct comp_server *server)
 				log_xdg_state("arrange-scroll:skip-not-initialized", v);
 				continue;
 			}
-			const int rel = (int)j - server->scroll_index;
+			const int rel = (int)j - *scr;
 			const int x = box.x + rel * box.width;
 			const int y = box.y;
 			v->layout_tgt_x = x;
@@ -1001,6 +1025,109 @@ void server_arrange_toplevels(struct comp_server *server)
 	free(arr);
 }
 
+void server_workspace_apply_visibility(struct comp_server *server)
+{
+	struct comp_toplevel *t;
+	wl_list_for_each(t, &server->toplevels, link) {
+		if (!t->xdg_toplevel->base->surface->mapped) {
+			wlr_scene_node_set_enabled(&t->scene_tree->node, false);
+			continue;
+		}
+		const bool vis = t->workspace == server->current_workspace;
+		wlr_scene_node_set_enabled(&t->scene_tree->node, vis);
+	}
+}
+
+void server_workspace_go(struct comp_server *server, int idx)
+{
+	if (idx < 0) {
+		idx = 0;
+	}
+	if (idx >= COMP_WORKSPACE_COUNT) {
+		idx = COMP_WORKSPACE_COUNT - 1;
+	}
+	if (idx == server->current_workspace) {
+		return;
+	}
+	server->current_workspace = idx;
+	struct comp_toplevel *t;
+	wl_list_for_each(t, &server->toplevels, link) {
+		t->layout_anim_tracked = false;
+	}
+	if (server->focused_toplevel && server->focused_toplevel->workspace != server->current_workspace) {
+		server->focused_toplevel = NULL;
+		wlr_seat_keyboard_notify_clear_focus(server->seat);
+	}
+	struct comp_toplevel *pick = NULL;
+	wl_list_for_each(t, &server->toplevels, link) {
+		if (t->workspace == server->current_workspace && t->xdg_toplevel->base->surface->mapped &&
+		    t->xdg_toplevel->base->initialized) {
+			pick = t;
+			break;
+		}
+	}
+	if (pick) {
+		focus_toplevel(server, pick);
+	}
+	server_workspace_apply_visibility(server);
+	if (server->layout == COMP_LAYOUT_TILE || server->layout == COMP_LAYOUT_SCROLL) {
+		layer_shell_arrange(server);
+	}
+	comp_config_sync_shell_env(server);
+	ext_workspace_notify(server);
+}
+
+void server_workspace_relative(struct comp_server *server, int delta)
+{
+	if (delta == 0) {
+		return;
+	}
+	const int n = COMP_WORKSPACE_COUNT;
+	int idx = server->current_workspace + delta;
+	idx %= n;
+	if (idx < 0) {
+		idx += n;
+	}
+	server_workspace_go(server, idx);
+}
+
+void server_workspace_move_focused(struct comp_server *server, int target)
+{
+	struct comp_toplevel *f = server->focused_toplevel;
+	if (!f || !f->xdg_toplevel->base->surface->mapped) {
+		return;
+	}
+	if (target < 0 || target >= COMP_WORKSPACE_COUNT || f->workspace == target) {
+		return;
+	}
+	const bool was_focused = server->focused_toplevel == f;
+	f->workspace = target;
+	f->layout_anim_tracked = false;
+	if (was_focused && target != server->current_workspace) {
+		struct comp_toplevel *pick = NULL;
+		struct comp_toplevel *t;
+		wl_list_for_each(t, &server->toplevels, link) {
+			if (t != f && t->workspace == server->current_workspace &&
+			    t->xdg_toplevel->base->surface->mapped) {
+				pick = t;
+				break;
+			}
+		}
+		if (pick) {
+			focus_toplevel(server, pick);
+		} else {
+			server->focused_toplevel = NULL;
+			wlr_seat_keyboard_notify_clear_focus(server->seat);
+		}
+	}
+	server_workspace_apply_visibility(server);
+	if (server->layout == COMP_LAYOUT_TILE || server->layout == COMP_LAYOUT_SCROLL) {
+		layer_shell_arrange(server);
+	}
+	comp_config_sync_shell_env(server);
+	server_sync_xdg_decorations(server);
+}
+
 void server_tile_move_focused_n(struct comp_server *server, int steps)
 {
 	if ((server->layout != COMP_LAYOUT_TILE && server->layout != COMP_LAYOUT_SCROLL) || steps == 0) {
@@ -1047,13 +1174,14 @@ void server_scroll_move(struct comp_server *server, int steps)
 		free(arr);
 		return;
 	}
-	int idx = server->scroll_index + steps;
+	int *const scr = &server->workspace_scroll_index[server->current_workspace];
+	int idx = *scr + steps;
 	if (idx < 0) {
 		idx = 0;
 	} else if (idx >= (int)n) {
 		idx = (int)n - 1;
 	}
-	server->scroll_index = idx;
+	*scr = idx;
 	free(arr);
 	server_arrange_toplevels(server);
 }
@@ -1298,7 +1426,7 @@ void server_set_layout(struct comp_server *server, enum comp_layout layout)
 	if (layout == COMP_LAYOUT_TILE || layout == COMP_LAYOUT_SCROLL) {
 		server_refresh_all_tile_props(server);
 		if (layout == COMP_LAYOUT_SCROLL) {
-			server->scroll_index = 0;
+			server->workspace_scroll_index[server->current_workspace] = 0;
 			scroll_sync_to_focused(server);
 		}
 		server_arrange_toplevels(server);
@@ -1313,7 +1441,7 @@ void server_set_layout(struct comp_server *server, enum comp_layout layout)
 		}
 	}
 	server_sync_xdg_decorations(server);
-	comp_config_sync_layout_env(server->layout);
+	comp_config_sync_shell_env(server);
 }
 
 void server_toggle_layout(struct comp_server *server)
@@ -1396,6 +1524,43 @@ static void ipc_process_line(struct comp_server *server, char *line)
 			server_set_layout(server, COMP_LAYOUT_STACK);
 		} else {
 			wlr_log(WLR_INFO, "ipc: unknown layout subcommand '%s'", rest);
+		}
+		return;
+	}
+	if (!strncmp(line, "workspace ", 10)) {
+		const char *rest = line + 10;
+		while (*rest == ' ' || *rest == '\t') {
+			rest++;
+		}
+		if (!strncmp(rest, "move ", 5)) {
+			rest += 5;
+			while (*rest == ' ' || *rest == '\t') {
+				rest++;
+			}
+			char *end = NULL;
+			const long w = strtol(rest, &end, 10);
+			if (end != rest && (!end || !*end) && w >= 1 && w <= COMP_WORKSPACE_COUNT) {
+				server_workspace_move_focused(server, (int)w - 1);
+			} else {
+				wlr_log(WLR_INFO, "ipc: workspace move needs 1..%d", COMP_WORKSPACE_COUNT);
+			}
+			return;
+		}
+		if (!strcmp(rest, "next")) {
+			server_workspace_relative(server, 1);
+			return;
+		}
+		if (!strcmp(rest, "prev")) {
+			server_workspace_relative(server, -1);
+			return;
+		}
+		char *end = NULL;
+		const long v = strtol(rest, &end, 10);
+		if (end != rest && (!end || !*end) && v >= 1 && v <= COMP_WORKSPACE_COUNT) {
+			server_workspace_go(server, (int)v - 1);
+		} else {
+			wlr_log(WLR_INFO, "ipc: unknown workspace '%s' (use 1..%d, next, prev, move N)", rest,
+				COMP_WORKSPACE_COUNT);
 		}
 		return;
 	}
@@ -1489,6 +1654,7 @@ static bool server_reload_config(struct comp_server *server)
 		server_arrange_toplevels(server);
 	}
 	server_sync_xdg_decorations(server);
+	comp_config_sync_shell_env(server);
 	comp_config_run_reload(server->config);
 	wlr_log(WLR_INFO, "reload: loaded config from %s", path);
 	return true;
@@ -1782,7 +1948,8 @@ static void server_cursor_button(struct wl_listener *listener, void *data)
 			double sx, sy;
 			struct comp_toplevel *drop =
 				toplevel_at(server, server->cursor->x, server->cursor->y, &sx, &sy);
-			if (drop && drop != dragged && !dragged->tile_float && !drop->tile_float) {
+			if (drop && drop != dragged && !dragged->tile_float && !drop->tile_float &&
+			    dragged->workspace == drop->workspace) {
 				tile_swap_sort_keys(dragged, drop);
 			}
 			if (dragged->layout_anim_tracked) {
@@ -1961,6 +2128,7 @@ bool server_init(struct comp_server *server)
 		wlr_log(WLR_ERROR, "ipc: disabled (initialization failed)");
 		server->ipc_enabled = false;
 	}
+	ext_workspace_init(server);
 	return true;
 }
 
@@ -1970,6 +2138,7 @@ static void server_finish(struct comp_server *server)
 		comp_config_run_shutdown(server->config);
 	}
 	compositor_session_active = false;
+	ext_workspace_fini(server);
 	ipc_fini(server);
 	comp_config_free(server->config);
 	server->config = NULL;
@@ -2003,6 +2172,10 @@ int main(int argc, char **argv)
 	char tile_grid_line[64];
 	bool scroll_move_from_argv = false;
 	char scroll_move_line[64];
+	bool workspace_from_argv = false;
+	char workspace_line[64];
+	bool workspace_move_from_argv = false;
+	char workspace_move_line[64];
 	bool no_ipc = false;
 	bool reload_config_from_argv = false;
 
@@ -2115,6 +2288,43 @@ int main(int argc, char **argv)
 				snprintf(scroll_move_line, sizeof(scroll_move_line), "scroll %s\n", v);
 			}
 			scroll_move_from_argv = true;
+		} else if (!strcmp(argv[i], "--workspace")) {
+			if (i + 1 >= argc) {
+				wlr_log(WLR_ERROR, "Missing value after --workspace");
+				return 1;
+			}
+			const char *v = argv[++i];
+			if (!strcasecmp(v, "next")) {
+				snprintf(workspace_line, sizeof(workspace_line), "workspace next\n");
+			} else if (!strcasecmp(v, "prev")) {
+				snprintf(workspace_line, sizeof(workspace_line), "workspace prev\n");
+			} else {
+				char *end = NULL;
+				const long n = strtol(v, &end, 10);
+				if (!end || end == v || *end || n < 1 || n > COMP_WORKSPACE_COUNT) {
+					wlr_log(WLR_ERROR,
+						"Unknown --workspace %s (use 1..%d, next, or prev)", v,
+						COMP_WORKSPACE_COUNT);
+					return 1;
+				}
+				snprintf(workspace_line, sizeof(workspace_line), "workspace %ld\n", n);
+			}
+			workspace_from_argv = true;
+		} else if (!strcmp(argv[i], "--workspace-move")) {
+			if (i + 1 >= argc) {
+				wlr_log(WLR_ERROR, "Missing value after --workspace-move");
+				return 1;
+			}
+			const char *v = argv[++i];
+			char *end = NULL;
+			const long n = strtol(v, &end, 10);
+			if (!end || end == v || *end || n < 1 || n > COMP_WORKSPACE_COUNT) {
+				wlr_log(WLR_ERROR, "Unknown --workspace-move %s (use 1..%d)", v,
+					COMP_WORKSPACE_COUNT);
+				return 1;
+			}
+			snprintf(workspace_move_line, sizeof(workspace_move_line), "workspace move %ld\n", n);
+			workspace_move_from_argv = true;
 		} else if (!strcmp(argv[i], "--ipc")) {
 			/* IPC is default-on when XDG_RUNTIME_DIR is set; flag kept for scripts. */
 		} else if (!strcmp(argv[i], "--no-ipc")) {
@@ -2155,6 +2365,20 @@ int main(int argc, char **argv)
 		}
 		wlr_log(WLR_INFO, "Sent scroll move to running stackcomp via IPC");
 	}
+	if (workspace_move_from_argv) {
+		if (ipc_client_send_line(workspace_move_line) != 0) {
+			wlr_log(WLR_ERROR, "No running stackcomp or IPC failed for --workspace-move");
+			return 1;
+		}
+		wlr_log(WLR_INFO, "Sent workspace move to running stackcomp via IPC");
+	}
+	if (workspace_from_argv) {
+		if (ipc_client_send_line(workspace_line) != 0) {
+			wlr_log(WLR_ERROR, "No running stackcomp or IPC failed for --workspace");
+			return 1;
+		}
+		wlr_log(WLR_INFO, "Sent workspace to running stackcomp via IPC");
+	}
 	if (layout_from_argv) {
 		char line[48];
 		const char *layout_word = initial_layout == COMP_LAYOUT_TILE ? "tile" :
@@ -2165,7 +2389,8 @@ int main(int argc, char **argv)
 			return 0;
 		}
 	}
-	if (tile_move_from_argv || tile_grid_from_argv || scroll_move_from_argv) {
+	if (tile_move_from_argv || tile_grid_from_argv || scroll_move_from_argv ||
+	    workspace_from_argv || workspace_move_from_argv) {
 		return 0;
 	}
 	if (!cfg_path && comp_config_default_path(cfg_buf, sizeof(cfg_buf))) {
@@ -2182,7 +2407,8 @@ int main(int argc, char **argv)
 	struct comp_server server = {0};
 	server.config = cfg;
 	server.layout = initial_layout;
-	comp_config_sync_layout_env(server.layout);
+	server.current_workspace = 0;
+	comp_config_sync_shell_env(&server);
 	server.ipc_enabled = !no_ipc && ipc_socket_path(ipc_probe, sizeof(ipc_probe));
 	if (cfg_path && cfg_path[0]) {
 		server.config_path = strdup(cfg_path);
