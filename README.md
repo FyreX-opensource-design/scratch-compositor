@@ -9,6 +9,7 @@ A stacking, tiling, and scrolling hybrid compositor built from stratch with WL-R
 # Current protocal support
 * wlr layer shell (tested with swaybg & waybar)
 * wlr screencopy (tested with grim)
+* ext worspaces (tested with waybar)
 
 # Current repo structure
 * \[config]: defult config for the compositor

@@ -58,6 +58,8 @@ struct comp_output {
 	struct wlr_scene_output *scene_output;
 	/** Layout coords: full output box minus layer-shell exclusive zones (updated in layer_shell_arrange). */
 	struct wlr_box layer_workarea;
+	/** Scroll column index per workspace (scroll layout); independent per physical output. */
+	int workspace_scroll_slot[COMP_WORKSPACE_COUNT];
 	struct wl_listener frame;
 	struct wl_listener commit;
 	struct wl_listener destroy;
@@ -153,8 +155,6 @@ struct comp_server {
 	enum comp_layout layout;
 	struct comp_toplevel *focused_toplevel;
 	int current_workspace;
-	/** Scroll slot index per workspace (scroll layout only). */
-	int workspace_scroll_index[COMP_WORKSPACE_COUNT];
 	enum comp_grab grab;
 	struct comp_toplevel *grabbed_toplevel;
 	double grab_cursor_x, grab_cursor_y;

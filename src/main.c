@@ -40,6 +40,7 @@
 #include <wlr/types/wlr_xdg_output_v1.h>
 #include <wlr/types/wlr_xdg_decoration_v1.h>
 #include <wlr/types/wlr_xdg_shell.h>
+#include <wlr/util/box.h>
 #include <wlr/util/log.h>
 #include <xkbcommon/xkbcommon.h>
 
@@ -89,24 +90,6 @@ static struct comp_output *comp_output_from_wlr(struct comp_server *server, stru
 		}
 	}
 	return NULL;
-}
-
-static void scroll_sync_to_focused(struct comp_server *server)
-{
-	if (server->layout != COMP_LAYOUT_SCROLL || !server->focused_toplevel) {
-		return;
-	}
-	size_t n = 0;
-	struct comp_toplevel **arr = tile_sorted_views(server, &n);
-	if (!arr || n == 0) {
-		free(arr);
-		return;
-	}
-	const int idx = tile_sorted_index(arr, n, server->focused_toplevel);
-	if (idx >= 0) {
-		server->workspace_scroll_index[server->current_workspace] = idx;
-	}
-	free(arr);
 }
 
 /** Seconds since CLOCK_MONOTONIC epoch (for layout animation delta time). */
@@ -703,6 +686,90 @@ static int tile_sorted_index(struct comp_toplevel **arr, size_t n, struct comp_t
 	return -1;
 }
 
+/** Which output's `layer_workarea` contains the center of this tiled view (layout coordinates). */
+static struct comp_output *toplevel_tile_output(struct comp_toplevel *t)
+{
+	struct comp_server *server = t->server;
+	if (!t->xdg_toplevel->base->surface->mapped) {
+		return comp_output_from_wlr(server, primary_wlr_output(server));
+	}
+	const struct wlr_box *geo = &t->xdg_toplevel->base->geometry;
+	const double cx = (double)t->scene_tree->node.x + (double)geo->width * 0.5;
+	const double cy = (double)t->scene_tree->node.y + (double)geo->height * 0.5;
+	struct comp_output *o;
+	wl_list_for_each(o, &server->outputs, link) {
+		if (wlr_box_contains_point(&o->layer_workarea, cx, cy)) {
+			return o;
+		}
+	}
+	return comp_output_from_wlr(server, primary_wlr_output(server));
+}
+
+/**
+ * Sublist of `full` in stable tile order, only views assigned to `out`.
+ * Caller frees the returned pointer when non-NULL; does not free `full`.
+ */
+static struct comp_toplevel **tile_sorted_views_on_output(struct comp_server *server, struct comp_output *out,
+	struct comp_toplevel **full, size_t n_full, size_t *n_out)
+{
+	(void)server;
+	size_t cnt = 0;
+	for (size_t k = 0; k < n_full; k++) {
+		if (toplevel_tile_output(full[k]) == out) {
+			cnt++;
+		}
+	}
+	if (cnt == 0) {
+		*n_out = 0;
+		return NULL;
+	}
+	struct comp_toplevel **sub = calloc(cnt, sizeof(*sub));
+	if (!sub) {
+		*n_out = 0;
+		return NULL;
+	}
+	size_t j = 0;
+	for (size_t k = 0; k < n_full; k++) {
+		if (toplevel_tile_output(full[k]) == out) {
+			sub[j++] = full[k];
+		}
+	}
+	*n_out = cnt;
+	return sub;
+}
+
+static void scroll_sync_to_focused(struct comp_server *server)
+{
+	if (server->layout != COMP_LAYOUT_SCROLL || !server->focused_toplevel) {
+		return;
+	}
+	struct comp_toplevel *f = server->focused_toplevel;
+	if (f->tile_float || !f->xdg_toplevel->base->surface->mapped) {
+		return;
+	}
+	struct comp_output *out = toplevel_tile_output(f);
+	if (!out) {
+		return;
+	}
+	size_t n_full = 0;
+	struct comp_toplevel **full = tile_sorted_views(server, &n_full);
+	if (!full) {
+		return;
+	}
+	size_t n = 0;
+	struct comp_toplevel **sub = tile_sorted_views_on_output(server, out, full, n_full, &n);
+	free(full);
+	if (!sub || n == 0) {
+		free(sub);
+		return;
+	}
+	const int idx = tile_sorted_index(sub, n, f);
+	if (idx >= 0) {
+		out->workspace_scroll_slot[server->current_workspace] = idx;
+	}
+	free(sub);
+}
+
 static void toplevel_unmap(struct wl_listener *listener, void *data)
 {
 	(void)data;
@@ -930,20 +997,12 @@ void server_arrange_toplevels(struct comp_server *server)
 	if (server->layout != COMP_LAYOUT_TILE && server->layout != COMP_LAYOUT_SCROLL) {
 		return;
 	}
-	struct wlr_box box;
-	if (wl_list_length(&server->outputs) == 1) {
-		struct comp_output *o = wl_container_of(server->outputs.next, o, link);
-		box = o->layer_workarea;
-	} else {
-		wlr_output_layout_get_box(server->output_layout, NULL, &box);
-	}
-	if (box.width <= 0 || box.height <= 0) {
+	if (wl_list_empty(&server->outputs)) {
 		return;
 	}
-	const bool anim_on = layout_anim_effective(server);
-	size_t n_tile = 0;
-	struct comp_toplevel **arr = tile_sorted_views(server, &n_tile);
-	if (!arr) {
+	size_t n_full = 0;
+	struct comp_toplevel **full = tile_sorted_views(server, &n_full);
+	if (!full) {
 		struct comp_toplevel *u;
 		wl_list_for_each(u, &server->toplevels, link) {
 			u->layout_anim_tracked = false;
@@ -961,27 +1020,73 @@ void server_arrange_toplevels(struct comp_server *server)
 		}
 	}
 
-	if (server->layout == COMP_LAYOUT_SCROLL) {
-		int *const scr = &server->workspace_scroll_index[server->current_workspace];
-		if (*scr < 0) {
-			*scr = 0;
+	const bool anim_on = layout_anim_effective(server);
+	struct comp_output *out;
+	wl_list_for_each(out, &server->outputs, link) {
+		struct wlr_box box = out->layer_workarea;
+		if (box.width <= 0 || box.height <= 0) {
+			continue;
 		}
-		if (*scr >= (int)n_tile) {
-			*scr = (int)n_tile - 1;
+		size_t n_tile = 0;
+		struct comp_toplevel **arr = tile_sorted_views_on_output(server, out, full, n_full, &n_tile);
+		if (!arr || n_tile == 0) {
+			free(arr);
+			continue;
 		}
+
+		if (server->layout == COMP_LAYOUT_SCROLL) {
+			int *const scr = &out->workspace_scroll_slot[server->current_workspace];
+			if (*scr < 0) {
+				*scr = 0;
+			}
+			if (*scr >= (int)n_tile) {
+				*scr = (int)n_tile - 1;
+			}
+			for (size_t j = 0; j < n_tile; j++) {
+				struct comp_toplevel *v = arr[j];
+				if (!v->xdg_toplevel->base->initialized) {
+					log_xdg_state("arrange-scroll:skip-not-initialized", v);
+					continue;
+				}
+				const int rel = (int)j - *scr;
+				const int x = box.x + rel * box.width;
+				const int y = box.y;
+				v->layout_tgt_x = x;
+				v->layout_tgt_y = y;
+				log_xdg_state("arrange-scroll:set_size", v);
+				wlr_xdg_toplevel_set_size(v->xdg_toplevel, box.width, box.height);
+				if (!anim_on || !v->layout_anim_tracked) {
+					v->layout_anim_x = (double)x;
+					v->layout_anim_y = (double)y;
+					wlr_scene_node_set_position(&v->scene_tree->node, x, y);
+					v->layout_anim_tracked = true;
+				}
+			}
+			free(arr);
+			continue;
+		}
+
+		int cols, rows;
+		tile_grid_dims(n_tile, &cols, &rows);
+		const int cell_w = box.width / cols;
+		const int cell_h = box.height / rows;
+
 		for (size_t j = 0; j < n_tile; j++) {
 			struct comp_toplevel *v = arr[j];
 			if (!v->xdg_toplevel->base->initialized) {
-				log_xdg_state("arrange-scroll:skip-not-initialized", v);
+				log_xdg_state("arrange-tile:skip-not-initialized", v);
 				continue;
 			}
-			const int rel = (int)j - *scr;
-			const int x = box.x + rel * box.width;
-			const int y = box.y;
+			const int col = (int)(j % (size_t)cols);
+			const int row = (int)(j / (size_t)cols);
+			const int x = box.x + col * cell_w;
+			const int y = box.y + row * cell_h;
+			const int w = (col == cols - 1) ? (box.x + box.width - x) : cell_w;
+			const int h = (row == rows - 1) ? (box.y + box.height - y) : cell_h;
 			v->layout_tgt_x = x;
 			v->layout_tgt_y = y;
-			log_xdg_state("arrange-scroll:set_size", v);
-			wlr_xdg_toplevel_set_size(v->xdg_toplevel, box.width, box.height);
+			log_xdg_state("arrange-tile:set_size", v);
+			wlr_xdg_toplevel_set_size(v->xdg_toplevel, w, h);
 			if (!anim_on || !v->layout_anim_tracked) {
 				v->layout_anim_x = (double)x;
 				v->layout_anim_y = (double)y;
@@ -989,40 +1094,10 @@ void server_arrange_toplevels(struct comp_server *server)
 				v->layout_anim_tracked = true;
 			}
 		}
-		layout_anim_kick_outputs(server);
 		free(arr);
-		return;
 	}
-	int cols, rows;
-	tile_grid_dims(n_tile, &cols, &rows);
-	const int cell_w = box.width / cols;
-	const int cell_h = box.height / rows;
-
-	for (size_t j = 0; j < n_tile; j++) {
-		struct comp_toplevel *v = arr[j];
-		if (!v->xdg_toplevel->base->initialized) {
-			log_xdg_state("arrange-tile:skip-not-initialized", v);
-			continue;
-		}
-		const int col = (int)(j % (size_t)cols);
-		const int row = (int)(j / (size_t)cols);
-		const int x = box.x + col * cell_w;
-		const int y = box.y + row * cell_h;
-		const int w = (col == cols - 1) ? (box.x + box.width - x) : cell_w;
-		const int h = (row == rows - 1) ? (box.y + box.height - y) : cell_h;
-		v->layout_tgt_x = x;
-		v->layout_tgt_y = y;
-		log_xdg_state("arrange-tile:set_size", v);
-		wlr_xdg_toplevel_set_size(v->xdg_toplevel, w, h);
-		if (!anim_on || !v->layout_anim_tracked) {
-			v->layout_anim_x = (double)x;
-			v->layout_anim_y = (double)y;
-			wlr_scene_node_set_position(&v->scene_tree->node, x, y);
-			v->layout_anim_tracked = true;
-		}
-	}
+	free(full);
 	layout_anim_kick_outputs(server);
-	free(arr);
 }
 
 void server_workspace_apply_visibility(struct comp_server *server)
@@ -1140,9 +1215,16 @@ void server_tile_move_focused_n(struct comp_server *server, int steps)
 
 	const int sig = steps > 0 ? 1 : -1;
 	const int nabs = steps > 0 ? steps : -steps;
+	struct comp_output *out = toplevel_tile_output(f);
 	for (int c = 0; c < nabs; c++) {
+		size_t n_full = 0;
+		struct comp_toplevel **full = tile_sorted_views(server, &n_full);
+		if (!full) {
+			return;
+		}
 		size_t n = 0;
-		struct comp_toplevel **sorted = tile_sorted_views(server, &n);
+		struct comp_toplevel **sorted = tile_sorted_views_on_output(server, out, full, n_full, &n);
+		free(full);
 		if (!sorted || n < 2) {
 			free(sorted);
 			return;
@@ -1168,13 +1250,29 @@ void server_scroll_move(struct comp_server *server, int steps)
 	if (server->layout != COMP_LAYOUT_SCROLL || steps == 0) {
 		return;
 	}
+	struct comp_toplevel *f = server->focused_toplevel;
+	struct comp_output *out;
+	if (f && !f->tile_float && f->xdg_toplevel->base->surface->mapped) {
+		out = toplevel_tile_output(f);
+	} else {
+		out = comp_output_from_wlr(server, primary_wlr_output(server));
+	}
+	if (!out) {
+		return;
+	}
+	size_t n_full = 0;
+	struct comp_toplevel **full = tile_sorted_views(server, &n_full);
+	if (!full) {
+		return;
+	}
 	size_t n = 0;
-	struct comp_toplevel **arr = tile_sorted_views(server, &n);
+	struct comp_toplevel **arr = tile_sorted_views_on_output(server, out, full, n_full, &n);
+	free(full);
 	if (!arr || n == 0) {
 		free(arr);
 		return;
 	}
-	int *const scr = &server->workspace_scroll_index[server->current_workspace];
+	int *const scr = &out->workspace_scroll_slot[server->current_workspace];
 	int idx = *scr + steps;
 	if (idx < 0) {
 		idx = 0;
@@ -1195,9 +1293,16 @@ void server_tile_move_focused_edge(struct comp_server *server, bool to_first)
 	if (!f || f->tile_float || !f->xdg_toplevel->base->surface->mapped) {
 		return;
 	}
+	struct comp_output *out = toplevel_tile_output(f);
 	for (;;) {
+		size_t n_full = 0;
+		struct comp_toplevel **full = tile_sorted_views(server, &n_full);
+		if (!full) {
+			return;
+		}
 		size_t n = 0;
-		struct comp_toplevel **sorted = tile_sorted_views(server, &n);
+		struct comp_toplevel **sorted = tile_sorted_views_on_output(server, out, full, n_full, &n);
+		free(full);
 		if (!sorted || n < 2) {
 			free(sorted);
 			return;
@@ -1229,9 +1334,16 @@ void server_tile_move_focused_grid_vert(struct comp_server *server, int steps)
 	}
 	const int sig = steps > 0 ? 1 : -1;
 	const int nabs = steps > 0 ? steps : -steps;
+	struct comp_output *out = toplevel_tile_output(f);
 	for (int c = 0; c < nabs; c++) {
+		size_t n_full = 0;
+		struct comp_toplevel **full = tile_sorted_views(server, &n_full);
+		if (!full) {
+			return;
+		}
 		size_t n = 0;
-		struct comp_toplevel **sorted = tile_sorted_views(server, &n);
+		struct comp_toplevel **sorted = tile_sorted_views_on_output(server, out, full, n_full, &n);
+		free(full);
 		if (!sorted || n < 2) {
 			free(sorted);
 			return;
@@ -1264,9 +1376,16 @@ void server_tile_move_focused_grid_vert_edge(struct comp_server *server, bool to
 	if (!f || f->tile_float || !f->xdg_toplevel->base->surface->mapped) {
 		return;
 	}
+	struct comp_output *out = toplevel_tile_output(f);
 	for (;;) {
+		size_t n_full = 0;
+		struct comp_toplevel **full = tile_sorted_views(server, &n_full);
+		if (!full) {
+			return;
+		}
 		size_t n = 0;
-		struct comp_toplevel **sorted = tile_sorted_views(server, &n);
+		struct comp_toplevel **sorted = tile_sorted_views_on_output(server, out, full, n_full, &n);
+		free(full);
 		if (!sorted || n < 2) {
 			free(sorted);
 			return;
@@ -1310,9 +1429,16 @@ void server_tile_move_focused_grid_horiz(struct comp_server *server, int steps)
 	}
 	const int sig = steps > 0 ? 1 : -1;
 	const int nabs = steps > 0 ? steps : -steps;
+	struct comp_output *out = toplevel_tile_output(f);
 	for (int c = 0; c < nabs; c++) {
+		size_t n_full = 0;
+		struct comp_toplevel **full = tile_sorted_views(server, &n_full);
+		if (!full) {
+			return;
+		}
 		size_t n = 0;
-		struct comp_toplevel **sorted = tile_sorted_views(server, &n);
+		struct comp_toplevel **sorted = tile_sorted_views_on_output(server, out, full, n_full, &n);
+		free(full);
 		if (!sorted || n < 2) {
 			free(sorted);
 			return;
@@ -1426,7 +1552,10 @@ void server_set_layout(struct comp_server *server, enum comp_layout layout)
 	if (layout == COMP_LAYOUT_TILE || layout == COMP_LAYOUT_SCROLL) {
 		server_refresh_all_tile_props(server);
 		if (layout == COMP_LAYOUT_SCROLL) {
-			server->workspace_scroll_index[server->current_workspace] = 0;
+			struct comp_output *o;
+			wl_list_for_each(o, &server->outputs, link) {
+				o->workspace_scroll_slot[server->current_workspace] = 0;
+			}
 			scroll_sync_to_focused(server);
 		}
 		server_arrange_toplevels(server);

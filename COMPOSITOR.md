@@ -5,8 +5,8 @@ Working document for the wlroots-based **stacking** compositor in this repo. Upd
 ## Current scope (implemented)
 
 - **Stacking / floating**: XDG toplevels are scene-graph siblings; focus raises a window (`wlr_scene_node_raise_to_top`) in stack mode.
-- **Tiling mode**: `COMP_LAYOUT_TILE` lays out mapped XDG toplevels in a **roughly square grid** (≈ `ceil(sqrt(n))` columns) over the full `wlr_output_layout` box, so both width and height are shared—not only full-height vertical strips. Uses `wlr_xdg_toplevel_set_size` + scene node position.
-- **Scroll mode**: `COMP_LAYOUT_SCROLL` is a niri-like horizontal strip: one tiled window per viewport width, with a **per-workspace** scroll slot tracking the visible column and focus syncing the viewport.
+- **Tiling mode**: `COMP_LAYOUT_TILE` lays out mapped XDG toplevels in a **roughly square grid** (≈ `ceil(sqrt(n))` columns) inside each physical output’s **`layer_workarea`** (layer-shell exclusive zones subtracted per head). Windows are assigned to an output by the **center** of their geometry in layout coordinates (fallback: primary / cursor output). Uses `wlr_xdg_toplevel_set_size` + scene node position.
+- **Scroll mode**: `COMP_LAYOUT_SCROLL` is a niri-like horizontal strip **per output**: one tiled window per that output’s workarea width, with a **per-workspace, per-output** scroll slot; focus / IPC scroll steps apply to the focused window’s output (or the primary output when none focused).
 - **Workspaces**: nine virtual desktops (`1`..`9`); new XDG toplevels attach to the current workspace. Only the active workspace’s toplevels are shown; tile/scroll arrange and scroll index are per workspace. Keybinds / IPC: `workspace`, `workspace_next`, `workspace_prev`, `workspace_move`; env `STACKCOMP_WORKSPACE` for `when=`. Panels can bind **`ext_workspace_manager_v1`** (**`ext-workspace-v1`**) to list workspaces and call **`activate`** (see **`PROTOCOLS.md`**); **waybar** and other bars need a workspace module compiled for this protocol, not Sway IPC. Example Waybar (**`ext/workspaces`**): **`config/waybar-stackcomp.jsonc`** + **`config/waybar-stackcomp.css`** — run with **`waybar -c …/waybar-stackcomp.jsonc -s …/waybar-stackcomp.css`** on **`$WAYLAND_DISPLAY`** after stackcomp starts (Waybar must include the ext-workspaces module; distro packages vary).
 - **wlroots 0.19**, scene graph (`wlr_scene_*`), **`xdg-shell`**, **`wlr-layer-shell` v4** (panels / overlays via `wlr_scene_layer_surface_v1`), **`zwlr_screencopy_manager_v1`** (via `wlr_screencopy_manager_v1_create` for tools like **grim**), core seat, pointer, keyboard, outputs via `wlr_output_layout`. **Wayland / portal protocol surface** is still small overall; see **`PROTOCOLS.md`** for details and portal expectations.
 - **Keybind config** (INI-style): repeated `[bind]` sections with `mods`, `key`, `action`, optional `command` (for `exec`), optional `when` (shell predicate, evaluated **on each key press**; exit 0 = bind active). Optional **`[hooks]`** section: **`startup`**, **`shutdown`**, **`reload`** shell strings (`sh -c`). See **`CONFIG.md`** for full syntax and every action; **`stackcomp.conf.example`** is a commented starter file. Modifiers and keysym are read **before** `wlr_keyboard_notify_key()` so XKB state matches user chord; `exec` / `when` / hooks use `posix_spawnp("sh", …)` instead of `fork` for safer interaction with wlroots’ threads.
@@ -67,6 +67,8 @@ Wayland clients cannot read arbitrary GTK/Qt theme files for **other** clients; 
 - **wlroots** protcals implementation
 
 ## Build & run
+
+`meson setup build && meson compile -C build`. Install with `meson install -C build` (or distro packaging): **`stackcomp`** goes to the prefix **`bindir`**, and **`data/stackcomp.desktop`** is installed as **`share/wayland-sessions/stackcomp.desktop`** so greetd, SDDM, and similar greeters can list a **Stackcomp** Wayland session.
 
 ```bash
 meson setup build && meson compile -C build

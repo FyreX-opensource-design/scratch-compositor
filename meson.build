@@ -63,3 +63,8 @@ executable(
   dependencies: [wlroots, wayland_server, xkbcommon, m_dep],
   install: true,
 )
+
+install_data(
+  files('data/stackcomp.desktop'),
+  install_dir: get_option('datadir') / 'wayland-sessions',
+)

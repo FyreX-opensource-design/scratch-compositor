@@ -124,7 +124,7 @@ Unless noted, tiling-related actions are **no-ops** when not in **tile** layout,
 
 ### Workspaces (9 virtual desktops)
 
-There are **nine** workspaces (**`1`**..**`9`** in config and IPC; internally zero-based). New windows open on the **current** workspace. Only windows on the **active** workspace are **visible** and receive pointer hits; tiling and scroll logic apply **per workspace** (each workspace has its own **scroll** slot index). **`when=`** predicates can use **`STACKCOMP_WORKSPACE`**.
+There are **nine** workspaces (**`1`**..**`9`** in config and IPC; internally zero-based). New windows open on the **current** workspace. Only windows on the **active** workspace are **visible** and receive pointer hits; tiling and scroll logic apply **per workspace**. In **scroll** layout, the visible column index is stored **per workspace and per physical output** (multi-monitor: each head scrolls independently). **`when=`** predicates can use **`STACKCOMP_WORKSPACE`**.
 
 | `action` | Aliases | `command` | Effect |
 |----------|---------|-----------|--------|
