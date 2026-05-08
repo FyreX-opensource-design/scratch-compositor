@@ -15,3 +15,6 @@ A stacking, tiling, and scrolling hybrid compositor built from stratch with WL-R
 # Current repo structure
 * \[config]: defult config for the compositor
 * \[testing]: testing files for the compositor
+
+# Deps
+`xorg-xwayland` Runtime: Xwayland support
