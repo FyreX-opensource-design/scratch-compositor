@@ -44,6 +44,7 @@
 #include <wlr/types/wlr_xdg_output_v1.h>
 #include <wlr/types/wlr_xdg_decoration_v1.h>
 #include <wlr/types/wlr_xdg_shell.h>
+#include <wlr/xwayland/xwayland.h>
 #include <wlr/util/box.h>
 #include <wlr/util/edges.h>
 #include <wlr/util/log.h>
@@ -84,6 +85,72 @@ static struct comp_tablet *comp_tablet_from_wlr(struct comp_server *server, stru
 static struct comp_tablet_tool *tablet_tool_get_or_create(struct comp_server *srv, struct comp_tablet *tab,
 	struct wlr_tablet_tool *wtool);
 
+static void xwayland_ready(struct wl_listener *listener, void *data);
+static void xwayland_new_surface(struct wl_listener *listener, void *data);
+static void xwayland_handle_associate(struct wl_listener *listener, void *data);
+static void xwayland_handle_dissociate(struct wl_listener *listener, void *data);
+static void xwayland_request_resize(struct wl_listener *listener, void *data);
+static void toplevel_handle_set_class(struct wl_listener *listener, void *data);
+
+static struct wlr_surface *toplevel_wlr_surface(const struct comp_toplevel *v)
+{
+	if (v->xdg_toplevel) {
+		return v->xdg_toplevel->base->surface;
+	}
+	return v->xwayland_surface ? v->xwayland_surface->surface : NULL;
+}
+
+static bool toplevel_surface_mapped(const struct comp_toplevel *v)
+{
+	struct wlr_surface *s = toplevel_wlr_surface(v);
+	return s && s->mapped;
+}
+
+static bool toplevel_surface_initialized(const struct comp_toplevel *v)
+{
+	if (v->xdg_toplevel) {
+		return v->xdg_toplevel->base->initialized;
+	}
+	return v->xwayland_surface && v->xwayland_surface->surface;
+}
+
+static void toplevel_title_app_for_config(const struct comp_toplevel *v, const char **title_out,
+	const char **app_out)
+{
+	if (v->xdg_toplevel) {
+		*title_out = v->xdg_toplevel->title ? v->xdg_toplevel->title : "";
+		*app_out = v->xdg_toplevel->app_id ? v->xdg_toplevel->app_id : "";
+	} else if (v->xwayland_surface) {
+		*title_out = v->xwayland_surface->title ? v->xwayland_surface->title : "";
+		*app_out = v->xwayland_surface->class ? v->xwayland_surface->class : "";
+	} else {
+		*title_out = "";
+		*app_out = "";
+	}
+}
+
+static void toplevel_set_activated(struct comp_toplevel *v, bool activated)
+{
+	if (v->xdg_toplevel) {
+		wlr_xdg_toplevel_set_activated(v->xdg_toplevel, activated);
+	} else if (v->xwayland_surface) {
+		wlr_xwayland_surface_activate(v->xwayland_surface, activated);
+	}
+}
+
+/** Tile/scroll: resize client; xdg ignores compositor x/y (scene positions the surface). */
+static void toplevel_arrange_tile(struct comp_toplevel *v, int layout_x, int layout_y, int w, int h)
+{
+	if (v->xdg_toplevel) {
+		(void)layout_x;
+		(void)layout_y;
+		wlr_xdg_toplevel_set_size(v->xdg_toplevel, w, h);
+	} else if (v->xwayland_surface) {
+		wlr_xwayland_surface_configure(v->xwayland_surface, (int16_t)layout_x, (int16_t)layout_y, (uint16_t)w,
+			(uint16_t)h);
+	}
+}
+
 /** True after `wlr_backend_start` so shutdown hook runs only for a real session. */
 static bool compositor_session_active;
 /** Verbose XDG lifecycle logs (off by default). Enable with `STACKCOMP_DEBUG_XDG=1`. */
@@ -122,12 +189,12 @@ static void foreign_toplevel_refresh(struct comp_toplevel *view)
 	if (!view || !view->foreign_toplevel) {
 		return;
 	}
-	const char *title = view->xdg_toplevel->title ? view->xdg_toplevel->title : "";
-	const char *app_id = view->xdg_toplevel->app_id ? view->xdg_toplevel->app_id : "";
+	const char *title = "";
+	const char *app_id = "";
+	toplevel_title_app_for_config(view, &title, &app_id);
 	wlr_foreign_toplevel_handle_v1_set_title(view->foreign_toplevel, title);
 	wlr_foreign_toplevel_handle_v1_set_app_id(view->foreign_toplevel, app_id);
-	const bool activated = view->server->focused_toplevel == view &&
-		view->xdg_toplevel->base->surface->mapped &&
+	const bool activated = view->server->focused_toplevel == view && toplevel_surface_mapped(view) &&
 		view->workspace == view->server->current_workspace;
 	wlr_foreign_toplevel_handle_v1_set_activated(view->foreign_toplevel, activated);
 }
@@ -185,7 +252,7 @@ static bool layout_anim_tick(struct comp_server *server, const struct timespec *
 		if (v->workspace != server->current_workspace) {
 			continue;
 		}
-		if (!v->xdg_toplevel->base->surface->mapped || v->tile_float) {
+		if (!toplevel_surface_mapped(v) || v->tile_float) {
 			continue;
 		}
 		if (server->grab == COMP_GRAB_MOVE && v == server->grabbed_toplevel) {
@@ -224,7 +291,7 @@ static void layout_anim_kick_outputs(struct comp_server *server)
 	const double eps = server->config->layout_anim_epsilon;
 	struct comp_toplevel *v;
 	wl_list_for_each(v, &server->toplevels, link) {
-		if (!v->layout_anim_tracked || !v->xdg_toplevel->base->surface->mapped || v->tile_float) {
+		if (!v->layout_anim_tracked || !toplevel_surface_mapped(v) || v->tile_float) {
 			continue;
 		}
 		if (v->workspace != server->current_workspace) {
@@ -266,7 +333,10 @@ static struct comp_toplevel *toplevel_at(struct comp_server *server, double lx, 
 	struct wlr_surface *root = wlr_surface_get_root_surface(surf);
 	struct comp_toplevel *t;
 	wl_list_for_each(t, &server->toplevels, link) {
-		if (t->xdg_toplevel->base->surface == root) {
+		if (t->xdg_toplevel && t->xdg_toplevel->base->surface == root) {
+			return t;
+		}
+		if (t->xwayland_surface && t->xwayland_surface->surface == root) {
 			return t;
 		}
 	}
@@ -542,7 +612,7 @@ static void server_new_output(struct wl_listener *listener, void *data)
 	wl_list_insert(&server->outputs, &output->link);
 	struct comp_toplevel *t;
 	wl_list_for_each(t, &server->toplevels, link) {
-		if (t->foreign_toplevel && t->xdg_toplevel->base->surface->mapped) {
+		if (t->foreign_toplevel && toplevel_surface_mapped(t)) {
 			wlr_foreign_toplevel_handle_v1_output_enter(t->foreign_toplevel, wlr_output);
 		}
 	}
@@ -560,8 +630,10 @@ static void toplevel_refresh_tile_props(struct comp_toplevel *view)
 		view->tile_order = 0;
 		return;
 	}
-	comp_config_tile_props_for_toplevel(view->server->config, view->xdg_toplevel->app_id,
-		view->xdg_toplevel->title, &view->tile_float, &view->tile_order);
+	const char *app_id = "";
+	const char *title = "";
+	toplevel_title_app_for_config(view, &title, &app_id);
+	comp_config_tile_props_for_toplevel(view->server->config, app_id, title, &view->tile_float, &view->tile_order);
 }
 
 static void server_refresh_all_tile_props(struct comp_server *server)
@@ -590,7 +662,7 @@ static void xdg_decoration_handle_request_mode(struct wl_listener *listener, voi
 
 static void toplevel_apply_decoration_mode(struct comp_toplevel *view)
 {
-	if (!view->xdg_decoration) {
+	if (!view->xdg_toplevel || !view->xdg_decoration) {
 		return;
 	}
 	/* wlr_xdg_toplevel_decoration_v1_set_mode schedules configure; wlroots asserts if !initialized. */
@@ -654,7 +726,7 @@ static void toplevel_handle_set_title(struct wl_listener *listener, void *data)
 	struct comp_toplevel *view = wl_container_of(listener, view, set_title);
 	toplevel_refresh_tile_props(view);
 	if ((view->server->layout == COMP_LAYOUT_TILE || view->server->layout == COMP_LAYOUT_SCROLL) &&
-	    view->xdg_toplevel->base->surface->mapped) {
+	    toplevel_surface_mapped(view)) {
 		server_arrange_toplevels(view->server);
 	}
 	server_sync_xdg_decorations(view->server);
@@ -667,7 +739,20 @@ static void toplevel_handle_set_app_id(struct wl_listener *listener, void *data)
 	struct comp_toplevel *view = wl_container_of(listener, view, set_app_id);
 	toplevel_refresh_tile_props(view);
 	if ((view->server->layout == COMP_LAYOUT_TILE || view->server->layout == COMP_LAYOUT_SCROLL) &&
-	    view->xdg_toplevel->base->surface->mapped) {
+	    toplevel_surface_mapped(view)) {
+		server_arrange_toplevels(view->server);
+	}
+	server_sync_xdg_decorations(view->server);
+	foreign_toplevel_refresh(view);
+}
+
+static void toplevel_handle_set_class(struct wl_listener *listener, void *data)
+{
+	(void)data;
+	struct comp_toplevel *view = wl_container_of(listener, view, set_class);
+	toplevel_refresh_tile_props(view);
+	if ((view->server->layout == COMP_LAYOUT_TILE || view->server->layout == COMP_LAYOUT_SCROLL) &&
+	    toplevel_surface_mapped(view)) {
 		server_arrange_toplevels(view->server);
 	}
 	server_sync_xdg_decorations(view->server);
@@ -678,7 +763,7 @@ static void foreign_toplevel_handle_request_activate(struct wl_listener *listene
 {
 	struct comp_toplevel *view = wl_container_of(listener, view, foreign_request_activate);
 	struct wlr_foreign_toplevel_handle_v1_activated_event *ev = data;
-	if (!view || !view->xdg_toplevel || !view->xdg_toplevel->base || !view->xdg_toplevel->base->surface->mapped) {
+	if (!view || (!view->xdg_toplevel && !view->xwayland_surface) || !toplevel_surface_mapped(view)) {
 		return;
 	}
 	if (ev && ev->seat && ev->seat != view->server->seat) {
@@ -695,10 +780,14 @@ static void foreign_toplevel_handle_request_close(struct wl_listener *listener, 
 {
 	(void)data;
 	struct comp_toplevel *view = wl_container_of(listener, view, foreign_request_close);
-	if (!view || !view->xdg_toplevel) {
+	if (!view || (!view->xdg_toplevel && !view->xwayland_surface)) {
 		return;
 	}
-	wlr_xdg_toplevel_send_close(view->xdg_toplevel);
+	if (view->xdg_toplevel) {
+		wlr_xdg_toplevel_send_close(view->xdg_toplevel);
+	} else {
+		wlr_xwayland_surface_close(view->xwayland_surface);
+	}
 }
 
 static int cmp_toplevel_tile_order(const void *va, const void *vb)
@@ -737,7 +826,7 @@ static struct comp_toplevel **tile_sorted_views(struct comp_server *server, size
 	size_t n_tile = 0;
 	struct comp_toplevel *t;
 	wl_list_for_each(t, &server->toplevels, link) {
-		if (!t->xdg_toplevel->base->surface->mapped || t->tile_float) {
+		if (!toplevel_surface_mapped(t) || t->tile_float) {
 			continue;
 		}
 		if (t->workspace != server->current_workspace) {
@@ -754,7 +843,7 @@ static struct comp_toplevel **tile_sorted_views(struct comp_server *server, size
 	}
 	size_t i = 0;
 	wl_list_for_each(t, &server->toplevels, link) {
-		if (!t->xdg_toplevel->base->surface->mapped || t->tile_float) {
+		if (!toplevel_surface_mapped(t) || t->tile_float) {
 			continue;
 		}
 		if (t->workspace != server->current_workspace) {
@@ -781,16 +870,27 @@ static int tile_sorted_index(struct comp_toplevel **arr, size_t n, struct comp_t
 static struct comp_output *toplevel_tile_output(struct comp_toplevel *t)
 {
 	struct comp_server *server = t->server;
-	if (!t->xdg_toplevel->base->surface->mapped) {
+	if (!toplevel_surface_mapped(t)) {
 		return comp_output_from_wlr(server, primary_wlr_output(server));
 	}
-	const struct wlr_box *geo = &t->xdg_toplevel->base->geometry;
-	const double cx = (double)t->scene_tree->node.x + (double)geo->width * 0.5;
-	const double cy = (double)t->scene_tree->node.y + (double)geo->height * 0.5;
-	struct comp_output *o;
-	wl_list_for_each(o, &server->outputs, link) {
-		if (wlr_box_contains_point(&o->layer_workarea, cx, cy)) {
-			return o;
+	if (t->xdg_toplevel) {
+		const struct wlr_box *geo = &t->xdg_toplevel->base->geometry;
+		const double cx = (double)t->scene_tree->node.x + (double)geo->width * 0.5;
+		const double cy = (double)t->scene_tree->node.y + (double)geo->height * 0.5;
+		struct comp_output *o;
+		wl_list_for_each(o, &server->outputs, link) {
+			if (wlr_box_contains_point(&o->layer_workarea, cx, cy)) {
+				return o;
+			}
+		}
+	} else {
+		const double cx = (double)t->scene_tree->node.x + (double)t->xwayland_surface->width * 0.5;
+		const double cy = (double)t->scene_tree->node.y + (double)t->xwayland_surface->height * 0.5;
+		struct comp_output *o;
+		wl_list_for_each(o, &server->outputs, link) {
+			if (wlr_box_contains_point(&o->layer_workarea, cx, cy)) {
+				return o;
+			}
 		}
 	}
 	return comp_output_from_wlr(server, primary_wlr_output(server));
@@ -835,7 +935,7 @@ static void scroll_sync_to_focused(struct comp_server *server)
 		return;
 	}
 	struct comp_toplevel *f = server->focused_toplevel;
-	if (f->tile_float || !f->xdg_toplevel->base->surface->mapped) {
+	if (f->tile_float || !toplevel_surface_mapped(f)) {
 		return;
 	}
 	struct comp_output *out = toplevel_tile_output(f);
@@ -890,21 +990,39 @@ static void toplevel_destroy(struct wl_listener *listener, void *data)
 		wl_list_remove(&view->xdg_decoration_request_mode.link);
 		view->xdg_decoration = NULL;
 	}
-	wl_list_remove(&view->map.link);
-	wl_list_remove(&view->unmap.link);
-	wl_list_remove(&view->commit.link);
+	if (view->xdg_toplevel) {
+		wl_list_remove(&view->map.link);
+		wl_list_remove(&view->unmap.link);
+		wl_list_remove(&view->commit.link);
+		wl_list_remove(&view->request_move.link);
+		wl_list_remove(&view->request_resize.link);
+		wl_list_remove(&view->set_title.link);
+		wl_list_remove(&view->set_app_id.link);
+	} else if (view->xwayland_surface) {
+		wl_list_remove(&view->xwayland_associate.link);
+		wl_list_remove(&view->xwayland_dissociate.link);
+		if (view->scene_tree) {
+			wl_list_remove(&view->map.link);
+			wl_list_remove(&view->unmap.link);
+			wl_list_remove(&view->request_move.link);
+			wl_list_remove(&view->request_resize.link);
+			wl_list_remove(&view->set_title.link);
+			wl_list_remove(&view->set_class.link);
+			wlr_scene_node_destroy(&view->scene_tree->node);
+			view->scene_tree = NULL;
+		}
+	}
 	wl_list_remove(&view->destroy.link);
-	wl_list_remove(&view->request_move.link);
-	wl_list_remove(&view->request_resize.link);
-	wl_list_remove(&view->set_title.link);
-	wl_list_remove(&view->set_app_id.link);
+	if (view->listed) {
+		wl_list_remove(&view->link);
+		view->listed = false;
+	}
 	if (view->foreign_toplevel) {
 		wl_list_remove(&view->foreign_request_activate.link);
 		wl_list_remove(&view->foreign_request_close.link);
 		wlr_foreign_toplevel_handle_v1_destroy(view->foreign_toplevel);
 		view->foreign_toplevel = NULL;
 	}
-	wl_list_remove(&view->link);
 	if (view->server->focused_toplevel == view) {
 		view->server->focused_toplevel = NULL;
 	}
@@ -925,6 +1043,9 @@ static void toplevel_commit(struct wl_listener *listener, void *data)
 {
 	(void)data;
 	struct comp_toplevel *view = wl_container_of(listener, view, commit);
+	if (!view->xdg_toplevel) {
+		return;
+	}
 	struct wlr_xdg_surface *xdg = view->xdg_toplevel->base;
 	log_xdg_state("commit", view);
 	/* wlroots 0.19 asserts if we schedule configure before initialized. */
@@ -939,8 +1060,17 @@ static void toplevel_map(struct wl_listener *listener, void *data)
 {
 	(void)data;
 	struct comp_toplevel *view = wl_container_of(listener, view, map);
-	log_xdg_state("map", view);
-	struct wlr_box *geo = &view->xdg_toplevel->base->geometry;
+	int gw;
+	int gh;
+	if (view->xdg_toplevel) {
+		log_xdg_state("map", view);
+		struct wlr_box *geo = &view->xdg_toplevel->base->geometry;
+		gw = geo->width;
+		gh = geo->height;
+	} else {
+		gw = view->xwayland_surface->width;
+		gh = view->xwayland_surface->height;
+	}
 	struct comp_output *o;
 	wl_list_for_each(o, &view->server->outputs, link) {
 		if (view->foreign_toplevel) {
@@ -961,8 +1091,8 @@ static void toplevel_map(struct wl_listener *listener, void *data)
 	toplevel_refresh_tile_props(view);
 	if (view->server->layout == COMP_LAYOUT_TILE || view->server->layout == COMP_LAYOUT_SCROLL) {
 		if (view->tile_float) {
-			int x = obox.x + (obox.width - geo->width) / 2;
-			int y = obox.y + (obox.height - geo->height) / 2;
+			int x = obox.x + (obox.width - gw) / 2;
+			int y = obox.y + (obox.height - gh) / 2;
 			wlr_scene_node_set_position(&view->scene_tree->node, x, y);
 			wlr_scene_node_raise_to_top(&view->scene_tree->node);
 			focus_toplevel(view->server, view);
@@ -977,8 +1107,8 @@ static void toplevel_map(struct wl_listener *listener, void *data)
 		server_sync_xdg_decorations(view->server);
 		return;
 	}
-	int x = obox.x + (obox.width - geo->width) / 2;
-	int y = obox.y + (obox.height - geo->height) / 2;
+	int x = obox.x + (obox.width - gw) / 2;
+	int y = obox.y + (obox.height - gh) / 2;
 	wlr_scene_node_set_position(&view->scene_tree->node, x, y);
 	wlr_scene_node_raise_to_top(&view->scene_tree->node);
 	focus_toplevel(view->server, view);
@@ -999,7 +1129,7 @@ static void toplevel_request_resize(struct wl_listener *listener, void *data)
 	struct wlr_xdg_toplevel_resize_event *ev = data;
 	struct comp_server *server = view->server;
 
-	if (!view->xdg_toplevel->base->surface->mapped) {
+	if (!view->xdg_toplevel || !toplevel_surface_mapped(view)) {
 		return;
 	}
 	if ((server->layout == COMP_LAYOUT_TILE || server->layout == COMP_LAYOUT_SCROLL) && !view->tile_float) {
@@ -1007,6 +1137,135 @@ static void toplevel_request_resize(struct wl_listener *listener, void *data)
 	}
 	focus_toplevel(server, view);
 	begin_resize(server, view, ev->edges);
+}
+
+static void xwayland_ready(struct wl_listener *listener, void *data)
+{
+	(void)data;
+	struct comp_server *server = wl_container_of(listener, server, xwayland_ready);
+	if (!server->xwayland) {
+		return;
+	}
+	wlr_xwayland_set_seat(server->xwayland, server->seat);
+	setenv("DISPLAY", server->xwayland->display_name, 1);
+	wlr_log(WLR_INFO, "Xwayland available on DISPLAY=%s", server->xwayland->display_name);
+}
+
+static void xwayland_handle_dissociate(struct wl_listener *listener, void *data)
+{
+	(void)data;
+	struct comp_toplevel *view = wl_container_of(listener, view, xwayland_dissociate);
+	if (!view->scene_tree) {
+		return;
+	}
+	if (view->server->focused_toplevel == view) {
+		view->server->focused_toplevel = NULL;
+		wlr_seat_keyboard_notify_clear_focus(view->server->seat);
+	}
+	if (view->server->grabbed_toplevel == view) {
+		view->server->grabbed_toplevel = NULL;
+		view->server->grab = COMP_GRAB_NONE;
+		view->server->swallow_left_release = false;
+	}
+	wl_list_remove(&view->map.link);
+	wl_list_remove(&view->unmap.link);
+	wl_list_remove(&view->request_move.link);
+	wl_list_remove(&view->request_resize.link);
+	wl_list_remove(&view->set_title.link);
+	wl_list_remove(&view->set_class.link);
+	wlr_scene_node_destroy(&view->scene_tree->node);
+	view->scene_tree = NULL;
+	if (view->listed) {
+		wl_list_remove(&view->link);
+		view->listed = false;
+	}
+	if ((view->server->layout == COMP_LAYOUT_TILE || view->server->layout == COMP_LAYOUT_SCROLL) &&
+	    view->server->grab != COMP_GRAB_MOVE) {
+		server_arrange_toplevels(view->server);
+	}
+	foreign_toplevel_refresh(view);
+}
+
+static void xwayland_request_resize(struct wl_listener *listener, void *data)
+{
+	struct comp_toplevel *view = wl_container_of(listener, view, request_resize);
+	struct wlr_xwayland_resize_event *ev = data;
+	struct comp_server *server = view->server;
+
+	if (!toplevel_surface_mapped(view)) {
+		return;
+	}
+	if ((server->layout == COMP_LAYOUT_TILE || server->layout == COMP_LAYOUT_SCROLL) && !view->tile_float) {
+		return;
+	}
+	focus_toplevel(server, view);
+	begin_resize(server, view, ev->edges);
+}
+
+static void xwayland_handle_associate(struct wl_listener *listener, void *data)
+{
+	(void)data;
+	struct comp_toplevel *view = wl_container_of(listener, view, xwayland_associate);
+	struct comp_server *server = view->server;
+	struct wlr_xwayland_surface *xsurface = view->xwayland_surface;
+
+	view->scene_tree = wlr_scene_tree_create(server->windows_tree);
+	if (!view->scene_tree) {
+		return;
+	}
+	view->scene_tree->node.data = view;
+	wlr_scene_surface_create(view->scene_tree, xsurface->surface);
+
+	view->foreign_toplevel = server->foreign_toplevel_manager ?
+		wlr_foreign_toplevel_handle_v1_create(server->foreign_toplevel_manager) : NULL;
+	if (view->foreign_toplevel) {
+		view->foreign_request_activate.notify = foreign_toplevel_handle_request_activate;
+		wl_signal_add(&view->foreign_toplevel->events.request_activate, &view->foreign_request_activate);
+		view->foreign_request_close.notify = foreign_toplevel_handle_request_close;
+		wl_signal_add(&view->foreign_toplevel->events.request_close, &view->foreign_request_close);
+	}
+
+	view->set_title.notify = toplevel_handle_set_title;
+	wl_signal_add(&xsurface->events.set_title, &view->set_title);
+	view->set_class.notify = toplevel_handle_set_class;
+	wl_signal_add(&xsurface->events.set_class, &view->set_class);
+	view->map.notify = toplevel_map;
+	wl_signal_add(&xsurface->surface->events.map, &view->map);
+	view->unmap.notify = toplevel_unmap;
+	wl_signal_add(&xsurface->surface->events.unmap, &view->unmap);
+	view->request_move.notify = toplevel_request_move;
+	wl_signal_add(&xsurface->events.request_move, &view->request_move);
+	view->request_resize.notify = xwayland_request_resize;
+	wl_signal_add(&xsurface->events.request_resize, &view->request_resize);
+
+	wl_list_insert(server->toplevels.prev, &view->link);
+	view->listed = true;
+	foreign_toplevel_refresh(view);
+}
+
+static void xwayland_new_surface(struct wl_listener *listener, void *data)
+{
+	struct comp_server *server = wl_container_of(listener, server, xwayland_new_surface);
+	struct wlr_xwayland_surface *xsurface = data;
+
+	struct comp_toplevel *view = calloc(1, sizeof(*view));
+	if (!view) {
+		return;
+	}
+	view->server = server;
+	view->xwayland_surface = xsurface;
+	view->xdg_toplevel = NULL;
+	view->tile_user_key = ++tile_user_key_gen;
+	view->tile_float = false;
+	view->tile_order = 0;
+	view->workspace = server->current_workspace;
+
+	view->xwayland_associate.notify = xwayland_handle_associate;
+	wl_signal_add(&xsurface->events.associate, &view->xwayland_associate);
+	view->xwayland_dissociate.notify = xwayland_handle_dissociate;
+	wl_signal_add(&xsurface->events.dissociate, &view->xwayland_dissociate);
+	view->destroy.notify = toplevel_destroy;
+	wl_signal_add(&xsurface->events.destroy, &view->destroy);
 }
 
 static void xdg_shell_new_toplevel(struct wl_listener *listener, void *data)
@@ -1017,6 +1276,7 @@ static void xdg_shell_new_toplevel(struct wl_listener *listener, void *data)
 	struct comp_toplevel *view = calloc(1, sizeof(*view));
 	view->server = server;
 	view->xdg_toplevel = xdg_toplevel;
+	view->xwayland_surface = NULL;
 	view->scene_tree = wlr_scene_xdg_surface_create(server->windows_tree, xdg_toplevel->base);
 	assert(view->scene_tree);
 	view->scene_tree->node.data = view;
@@ -1051,15 +1311,16 @@ static void xdg_shell_new_toplevel(struct wl_listener *listener, void *data)
 	view->request_resize.notify = toplevel_request_resize;
 	wl_signal_add(&xdg_toplevel->events.request_resize, &view->request_resize);
 	wl_list_insert(server->toplevels.prev, &view->link);
+	view->listed = true;
 	foreign_toplevel_refresh(view);
 }
 
 static void focus_toplevel(struct comp_server *server, struct comp_toplevel *toplevel)
 {
-	if (!toplevel || !toplevel->xdg_toplevel->base->surface->mapped) {
+	if (!toplevel || !toplevel_surface_mapped(toplevel)) {
 		return;
 	}
-	if (!toplevel->xdg_toplevel->base->initialized) {
+	if (toplevel->xdg_toplevel && !toplevel->xdg_toplevel->base->initialized) {
 		log_xdg_state("focus:skip-not-initialized", toplevel);
 		return;
 	}
@@ -1070,13 +1331,13 @@ static void focus_toplevel(struct comp_server *server, struct comp_toplevel *top
 	if (prev == toplevel) {
 		return;
 	}
-	if (prev && prev->xdg_toplevel->base->initialized) {
+	if (prev && toplevel_surface_initialized(prev)) {
 		log_xdg_state("focus:deactivate-prev", prev);
-		wlr_xdg_toplevel_set_activated(prev->xdg_toplevel, false);
+		toplevel_set_activated(prev, false);
 		foreign_toplevel_refresh(prev);
 	}
 	log_xdg_state("focus:activate-new", toplevel);
-	wlr_xdg_toplevel_set_activated(toplevel->xdg_toplevel, true);
+	toplevel_set_activated(toplevel, true);
 	if (server->layout == COMP_LAYOUT_STACK ||
 	    ((server->layout == COMP_LAYOUT_TILE || server->layout == COMP_LAYOUT_SCROLL) && toplevel->tile_float)) {
 		wlr_scene_node_raise_to_top(&toplevel->scene_tree->node);
@@ -1085,9 +1346,12 @@ static void focus_toplevel(struct comp_server *server, struct comp_toplevel *top
 	foreign_toplevel_refresh(toplevel);
 	scroll_sync_to_focused(server);
 
+	struct wlr_surface *surf = toplevel_wlr_surface(toplevel);
+	if (!surf) {
+		return;
+	}
 	struct wlr_seat *seat = server->seat;
 	struct wlr_keyboard *kbd = wlr_seat_get_keyboard(seat);
-	struct wlr_surface *surf = toplevel->xdg_toplevel->base->surface;
 	if (kbd) {
 		wlr_seat_keyboard_notify_enter(seat, surf, kbd->keycodes, kbd->num_keycodes, &kbd->modifiers);
 	} else {
@@ -1108,7 +1372,7 @@ static void begin_move(struct comp_server *server, struct comp_toplevel *view, b
 
 static void begin_resize(struct comp_server *server, struct comp_toplevel *view, uint32_t edges)
 {
-	if (!view || !view->xdg_toplevel->base->surface->mapped) {
+	if (!view || !toplevel_surface_mapped(view)) {
 		return;
 	}
 	server->grab = COMP_GRAB_RESIZE;
@@ -1117,11 +1381,18 @@ static void begin_resize(struct comp_server *server, struct comp_toplevel *view,
 	server->grab_cursor_y = server->cursor->y;
 	server->resize_edges = edges;
 
-	struct wlr_box geo = view->xdg_toplevel->base->geometry;
-	server->grab_view_x = view->scene_tree->node.x + geo.x;
-	server->grab_view_y = view->scene_tree->node.y + geo.y;
-	server->grab_view_width = geo.width;
-	server->grab_view_height = geo.height;
+	if (view->xdg_toplevel) {
+		struct wlr_box geo = view->xdg_toplevel->base->geometry;
+		server->grab_view_x = view->scene_tree->node.x + geo.x;
+		server->grab_view_y = view->scene_tree->node.y + geo.y;
+		server->grab_view_width = geo.width;
+		server->grab_view_height = geo.height;
+	} else {
+		server->grab_view_x = view->scene_tree->node.x;
+		server->grab_view_y = view->scene_tree->node.y;
+		server->grab_view_width = view->xwayland_surface->width;
+		server->grab_view_height = view->xwayland_surface->height;
+	}
 	server->swallow_left_release = false;
 }
 
@@ -1157,10 +1428,10 @@ void server_arrange_toplevels(struct comp_server *server)
 
 	struct comp_toplevel *t;
 	wl_list_for_each(t, &server->toplevels, link) {
-		if (!t->xdg_toplevel->base->surface->mapped) {
+		if (!toplevel_surface_mapped(t)) {
 			continue;
 		}
-		if (t->tile_float || !t->xdg_toplevel->base->initialized) {
+		if (t->tile_float || !toplevel_surface_initialized(t)) {
 			t->layout_anim_tracked = false;
 		}
 	}
@@ -1189,7 +1460,7 @@ void server_arrange_toplevels(struct comp_server *server)
 			}
 			for (size_t j = 0; j < n_tile; j++) {
 				struct comp_toplevel *v = arr[j];
-				if (!v->xdg_toplevel->base->initialized) {
+				if (!toplevel_surface_initialized(v)) {
 					log_xdg_state("arrange-scroll:skip-not-initialized", v);
 					continue;
 				}
@@ -1199,7 +1470,7 @@ void server_arrange_toplevels(struct comp_server *server)
 				v->layout_tgt_x = x;
 				v->layout_tgt_y = y;
 				log_xdg_state("arrange-scroll:set_size", v);
-				wlr_xdg_toplevel_set_size(v->xdg_toplevel, box.width, box.height);
+				toplevel_arrange_tile(v, x, y, box.width, box.height);
 				if (!anim_on || !v->layout_anim_tracked) {
 					v->layout_anim_x = (double)x;
 					v->layout_anim_y = (double)y;
@@ -1218,7 +1489,7 @@ void server_arrange_toplevels(struct comp_server *server)
 
 		for (size_t j = 0; j < n_tile; j++) {
 			struct comp_toplevel *v = arr[j];
-			if (!v->xdg_toplevel->base->initialized) {
+			if (!toplevel_surface_initialized(v)) {
 				log_xdg_state("arrange-tile:skip-not-initialized", v);
 				continue;
 			}
@@ -1231,7 +1502,7 @@ void server_arrange_toplevels(struct comp_server *server)
 			v->layout_tgt_x = x;
 			v->layout_tgt_y = y;
 			log_xdg_state("arrange-tile:set_size", v);
-			wlr_xdg_toplevel_set_size(v->xdg_toplevel, w, h);
+			toplevel_arrange_tile(v, x, y, w, h);
 			if (!anim_on || !v->layout_anim_tracked) {
 				v->layout_anim_x = (double)x;
 				v->layout_anim_y = (double)y;
@@ -1249,7 +1520,7 @@ void server_workspace_apply_visibility(struct comp_server *server)
 {
 	struct comp_toplevel *t;
 	wl_list_for_each(t, &server->toplevels, link) {
-		if (!t->xdg_toplevel->base->surface->mapped) {
+		if (!toplevel_surface_mapped(t)) {
 			wlr_scene_node_set_enabled(&t->scene_tree->node, false);
 			continue;
 		}
@@ -1280,8 +1551,8 @@ void server_workspace_go(struct comp_server *server, int idx)
 	}
 	struct comp_toplevel *pick = NULL;
 	wl_list_for_each(t, &server->toplevels, link) {
-		if (t->workspace == server->current_workspace && t->xdg_toplevel->base->surface->mapped &&
-		    t->xdg_toplevel->base->initialized) {
+		if (t->workspace == server->current_workspace && toplevel_surface_mapped(t) &&
+		    toplevel_surface_initialized(t)) {
 			pick = t;
 			break;
 		}
@@ -1315,7 +1586,7 @@ void server_workspace_relative(struct comp_server *server, int delta)
 void server_workspace_move_focused(struct comp_server *server, int target)
 {
 	struct comp_toplevel *f = server->focused_toplevel;
-	if (!f || !f->xdg_toplevel->base->surface->mapped) {
+	if (!f || !toplevel_surface_mapped(f)) {
 		return;
 	}
 	if (target < 0 || target >= COMP_WORKSPACE_COUNT || f->workspace == target) {
@@ -1328,8 +1599,7 @@ void server_workspace_move_focused(struct comp_server *server, int target)
 		struct comp_toplevel *pick = NULL;
 		struct comp_toplevel *t;
 		wl_list_for_each(t, &server->toplevels, link) {
-			if (t != f && t->workspace == server->current_workspace &&
-			    t->xdg_toplevel->base->surface->mapped) {
+			if (			    t != f && t->workspace == server->current_workspace && toplevel_surface_mapped(t)) {
 				pick = t;
 				break;
 			}
@@ -1356,7 +1626,7 @@ void server_tile_move_focused_n(struct comp_server *server, int steps)
 		return;
 	}
 	struct comp_toplevel *f = server->focused_toplevel;
-	if (!f || f->tile_float || !f->xdg_toplevel->base->surface->mapped) {
+	if (!f || f->tile_float || !toplevel_surface_mapped(f)) {
 		return;
 	}
 
@@ -1399,7 +1669,7 @@ void server_scroll_move(struct comp_server *server, int steps)
 	}
 	struct comp_toplevel *f = server->focused_toplevel;
 	struct comp_output *out;
-	if (f && !f->tile_float && f->xdg_toplevel->base->surface->mapped) {
+	if (f && !f->tile_float && toplevel_surface_mapped(f)) {
 		out = toplevel_tile_output(f);
 	} else {
 		out = comp_output_from_wlr(server, primary_wlr_output(server));
@@ -1437,7 +1707,7 @@ void server_tile_move_focused_edge(struct comp_server *server, bool to_first)
 		return;
 	}
 	struct comp_toplevel *f = server->focused_toplevel;
-	if (!f || f->tile_float || !f->xdg_toplevel->base->surface->mapped) {
+	if (!f || f->tile_float || !toplevel_surface_mapped(f)) {
 		return;
 	}
 	struct comp_output *out = toplevel_tile_output(f);
@@ -1476,7 +1746,7 @@ void server_tile_move_focused_grid_vert(struct comp_server *server, int steps)
 		return;
 	}
 	struct comp_toplevel *f = server->focused_toplevel;
-	if (!f || f->tile_float || !f->xdg_toplevel->base->surface->mapped) {
+	if (!f || f->tile_float || !toplevel_surface_mapped(f)) {
 		return;
 	}
 	const int sig = steps > 0 ? 1 : -1;
@@ -1520,7 +1790,7 @@ void server_tile_move_focused_grid_vert_edge(struct comp_server *server, bool to
 		return;
 	}
 	struct comp_toplevel *f = server->focused_toplevel;
-	if (!f || f->tile_float || !f->xdg_toplevel->base->surface->mapped) {
+	if (!f || f->tile_float || !toplevel_surface_mapped(f)) {
 		return;
 	}
 	struct comp_output *out = toplevel_tile_output(f);
@@ -1571,7 +1841,7 @@ void server_tile_move_focused_grid_horiz(struct comp_server *server, int steps)
 		return;
 	}
 	struct comp_toplevel *f = server->focused_toplevel;
-	if (!f || f->tile_float || !f->xdg_toplevel->base->surface->mapped) {
+	if (!f || f->tile_float || !toplevel_surface_mapped(f)) {
 		return;
 	}
 	const int sig = steps > 0 ? 1 : -1;
@@ -2650,7 +2920,7 @@ static void process_cursor_motion(struct comp_server *server, uint32_t time_msec
 		}
 
 		wlr_scene_node_set_position(&v->scene_tree->node, x, y);
-		wlr_xdg_toplevel_set_size(v->xdg_toplevel, w, h);
+		toplevel_arrange_tile(v, x, y, w, h);
 	}
 
 	double sx, sy;
@@ -2899,6 +3169,16 @@ bool server_init(struct comp_server *server)
 	}
 	wl_list_init(&server->tablets);
 	wl_list_init(&server->tracked_inputs);
+
+	server->xwayland = wlr_xwayland_create(dpy, server->compositor, true);
+	if (!server->xwayland) {
+		wlr_log(WLR_ERROR, "Could not create Xwayland object");
+	} else {
+		server->xwayland_ready.notify = xwayland_ready;
+		wl_signal_add(&server->xwayland->events.ready, &server->xwayland_ready);
+		server->xwayland_new_surface.notify = xwayland_new_surface;
+		wl_signal_add(&server->xwayland->events.new_surface, &server->xwayland_new_surface);
+	}
 
 	server->cursor_motion.notify = server_cursor_motion;
 	wl_signal_add(&server->cursor->events.motion, &server->cursor_motion);
@@ -3248,6 +3528,10 @@ int main(int argc, char **argv)
 
 	if (!wlr_backend_start(server.backend)) {
 		wlr_log(WLR_ERROR, "Failed to start backend");
+		if (server.xwayland) {
+			wlr_xwayland_destroy(server.xwayland);
+			server.xwayland = NULL;
+		}
 		server_finish(&server);
 		wl_display_destroy_clients(server.wl_display);
 		wl_display_destroy(server.wl_display);
@@ -3255,11 +3539,20 @@ int main(int argc, char **argv)
 	}
 	compositor_session_active = true;
 	setenv("WAYLAND_DISPLAY", socket, true);
+	/*
+	 * Do not set QT_QPA_PLATFORM globally: many bundles (e.g. Qt AppImages) ship only the
+	 * xcb plugin; forcing "wayland" makes Qt abort before falling back. Native Wayland Qt
+	 * apps still see WAYLAND_DISPLAY; with Xwayland, DISPLAY is valid for xcb.
+	 */
 	wlr_log(WLR_INFO, "Running compositor on WAYLAND_DISPLAY=%s", socket);
 	comp_config_run_startup(server.config);
 
 	wl_display_run(server.wl_display);
 
+	if (server.xwayland) {
+		wlr_xwayland_destroy(server.xwayland);
+		server.xwayland = NULL;
+	}
 	server_finish(&server);
 	wl_display_destroy_clients(server.wl_display);
 	wl_display_destroy(server.wl_display);
