@@ -4,6 +4,6 @@ Type=Application
 Name=Stackcomp
 Comment=Stacking, tiling, and scroll layouts (wlroots Wayland compositor)
 Exec=stackcomp
-TryExec=stackcomp
+TryExec=stackcomp -c ~/stackcomp/stackcomp.conf
 DesktopNames=Stackcomp
 Keywords=wm;wayland;compositor;wlroots;
