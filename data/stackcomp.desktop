@@ -3,7 +3,7 @@ Type=Application
 # Freedesktop Wayland session (install to share/wayland-sessions for greetd, SDDM, etc.)
 Name=Stackcomp
 Comment=Stacking, tiling, and scroll layouts (wlroots Wayland compositor)
-Exec=stackcomp -c ~/stackcomp/stackcomp.conf
-TryExec=stackcomp -c ~/stackcomp/stackcomp.conf
+Exec=stackcomp -c ~/.config/stackcomp/stackcomp.conf
+TryExec=stackcomp -c ~/.config/stackcomp/stackcomp.conf
 DesktopNames=Stackcomp
 Keywords=wm;wayland;compositor;wlroots;
